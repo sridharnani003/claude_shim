@@ -1,0 +1,11 @@
+# Build outputs
+*.dll
+*.exe
+*.obj
+*.exp
+*.lib
+*.pdb
+*.ilk
+*.map
+
+# Keep source, scripts, config, docs

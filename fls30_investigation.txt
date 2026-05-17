@@ -1,0 +1,278 @@
+================================================================================
+FLS30 FILE DOWNLOAD STALL — INVESTIGATION SUMMARY
+For second-opinion review
+Date: 2026-05-17
+================================================================================
+
+────────────────────────────────────────────────────────────────────────────────
+1. SYSTEM OVERVIEW
+────────────────────────────────────────────────────────────────────────────────
+
+FLS30.exe  — Legacy 32-bit Borland Delphi DAU ground-station software (Win7
+             era), running under Windows 11 via a compatibility shim.
+DAU        — Physical data acquisition unit connected over raw Ethernet.
+             EtherType = 0xAA55 for all frames.
+packet_shim.dll — A custom DLL we wrote that hooks FLS30's Win32 I/O calls
+             (CreateFile / ReadFile / WriteFile / DeviceIoControl) and routes
+             them through Npcap (wpcap.dll / pcap_open_live), because the old
+             NDIS 5.x "Packet" driver is not available on Windows 11.
+
+The shim was reverse-engineered from scratch using Ghidra on FLS30.exe and
+the original Win7 packet.sys kernel driver.  It is working: file listing,
+file selection, and download initiation all work correctly.  The ONLY
+remaining problem is the download stall described below.
+
+────────────────────────────────────────────────────────────────────────────────
+2. THE SYMPTOM
+────────────────────────────────────────────────────────────────────────────────
+
+- User selects a file (e.g. 6 MB) and clicks Download.
+- The progress bar moves for a while (fills to a random percentage).
+- TX/RX activity is visible in the debug log the whole time — the DAU keeps
+  sending frames and FLS30 keeps sending frames — but the progress bar freezes
+  and the download never completes, no matter how long you wait.
+- No error message from FLS30; it looks like it is still "working" but stuck.
+
+────────────────────────────────────────────────────────────────────────────────
+3. PROTOCOL — HOW THE FILE DOWNLOAD WORKS
+────────────────────────────────────────────────────────────────────────────────
+
+All frames are raw Ethernet (EtherType 0xAA55).
+Payload bytes [0..1] = frame type.  Payload is everything after the 14-byte
+Ethernet header (dest MAC 6 + src MAC 6 + EtherType 2).
+
+Frame types observed:
+
+  TX = FLS30 → DAU         RX = DAU → FLS30
+
+  TX 01 02  FILE-LIST      Request the list of files on the DAU
+  RX 01 02  FILE-LIST      DAU responds with list (135 files = 1381 bytes)
+  TX 01 05  FILE-SCAN      Request per-file metadata (one per file, ~159 bytes ea)
+  RX 01 05  FILE-SCAN      DAU responds with metadata for each file
+  TX 01 06  FILE-REQ       Request download of a specific file (146-byte frame)
+  RX 01 06  FILE-META      DAU responds with file metadata incl. total-block info
+  RX 02 01  FILE-CHUNK     DAU sends a data chunk (1028 bytes = 14+1014)
+                           Payload[2..5] = 32-bit LE sequence number
+  RX 02 02  FILE-ACK       DAU signals end of one window (60 bytes, minimum pad)
+  RX 01 0C  DAU-POLL       DAU asks "ready for next window?" (60 bytes)
+  TX 02 04  NEXT-WIN       FLS30 replies "send next window" (60 or 84 or 228 bytes)
+  TX 02 05  ABORT          FLS30 aborts the transfer
+
+Windowed download loop (one cycle per window):
+  1. DAU sends a burst of RX 02 01 FILE-CHUNK frames (e.g. 3527 chunks)
+  2. DAU sends RX 02 02 FILE-ACK  (window boundary marker)
+  3. DAU sends RX 01 0C DAU-POLL  ("ready for next window?")
+  4. FLS30 sends TX 02 04 NEXT-WIN ("yes, send next window")
+  5. Repeat from step 1 until all chunks delivered
+  6. DAU sends RX 02 03 FILE-DONE when complete
+
+The download stalls because step 4 does not happen after the first window
+boundary.  FLS30 never sends TX 02 04 NEXT-WIN after it receives the first
+RX 02 02 FILE-ACK.
+
+────────────────────────────────────────────────────────────────────────────────
+4. FLS30 STATE MACHINE (from Ghidra decompile)
+────────────────────────────────────────────────────────────────────────────────
+
+State 0xc  — set when FLS30 sends FILE-REQ (01 06).
+             Initialises two fields:
+               *(iStack_70 + 0xed4) = 0xFFFFFFFF   (last-window-start sentinel)
+               *(iStack_70 + 0xed8) = 0xFFFFFFFF   (expected-window-end sentinel)
+
+State 0xe  — set when DAU's FILE-META (01 06) response arrives.
+             This is the active-download state.
+
+Case 0xe handler for incoming 02 02 (FILE-ACK) — decompiled C, simplified:
+
+    WaitForSingleObject(semaphore, INFINITE);
+    FUN_0051f020();   // parse 02 02 frame → uStack_1b0, uStack_1b2, uStack_1ae
+
+    if ((uint)uStack_1b0 == *(int *)(iStack_70 + 0xed8) + 1U) {
+        // sequence boundary matches expected
+        *(iStack_70 + 0xeac) = uStack_1b2;
+        *(iStack_70 + 0xeb0) = uStack_1ae;   // ← saved window-count
+        *(iStack_70 + 0xea8) = uStack_1b0;
+
+        iVar4 = FUN_004379b8(iStack_70, uStack_1ae);  // ← chunk bitmap check
+        if (iVar4 == 0) {
+            // All chunks received — proceed to next phase / mark done
+            FUN_00437858(...);
+            *(iStack_70 + 0xed4) = 0xFFFFFFFF;   // ← marks download "done"
+            FUN_004c1fdc(..., 1);                 // update progress bar
+        } else {
+            // Some chunks missing — request next window
+            *(iStack_70 + 0xed4) = *(iStack_70 + 0xeac);
+            *(iStack_70 + 0xed8) = *(iStack_70 + 0xea8);
+            *(iStack_70 + 0xedc) = *(iStack_70 + 0xeb0);
+            FUN_00437c0c(...);   // ← sends TX 02 04 NEXT-WIN
+            FUN_004c1fdc(..., 1);
+        }
+    }
+    ReleaseSemaphore(semaphore, 1, NULL);
+
+────────────────────────────────────────────────────────────────────────────────
+5. FUN_004379b8 — THE CHUNK BITMAP CHECKER (critical function)
+────────────────────────────────────────────────────────────────────────────────
+
+bool FUN_004379b8(int param_1, ushort param_2) {
+    bool bVar1 = true;
+    WaitForSingleObject(mutex, INFINITE);
+
+    for (int i = 0; i < (int)(uint)param_2; i++) {
+        if (*(short *)(*(int *)(DAT_0056d3c0 + 0x30) + 0xc + i*2) == 0) {
+            // chunk i not received — add to retry list
+            bVar1 = false;
+        }
+    }
+    ReleaseSemaphore(mutex, 1, NULL);
+
+    if (bVar1) {
+        FUN_004692e4(...);
+        FUN_00442880(...);
+    }
+    return bVar1;   // true = all chunks present, false = gaps found
+}
+
+CRITICAL BUG:
+  If param_2 == 0, the for-loop body NEVER EXECUTES.
+  The function returns true (= "all chunks received, complete!")
+  even when most of the file has NOT been received.
+
+  Back in the case 0xe handler:
+    - iVar4 = FUN_004379b8(..., 0)  →  returns 0 (true in Delphi convention)
+    - The "iVar4 == 0" branch fires: *(0xed4) = 0xFFFFFFFF  (marks done)
+    - FUN_00437c0c (which sends NEXT-WIN) is NOT called
+    - A timer that was also sending periodic NEXT-WIN frames checks the
+      0xed4 flag and also stops
+
+  Result: FLS30 thinks the first window is fully received and the download
+  is complete.  The DAU is still waiting for a NEXT-WIN that never comes.
+  Both sides are stuck.
+
+────────────────────────────────────────────────────────────────────────────────
+6. ROOT CAUSE HYPOTHESIS
+────────────────────────────────────────────────────────────────────────────────
+
+param_2 passed to FUN_004379b8 = uStack_1ae = a field extracted from the
+DAU's 02 02 (FILE-ACK) frame by FUN_0051f020().
+
+The DAU sends 02 02 as a 60-byte Ethernet frame (minimum Ethernet length).
+The actual protocol payload may be only 4–6 bytes (type 2 + sequence 4),
+with the remaining bytes padded to zero by the NIC/driver.
+
+If the "window count" field that FLS30 reads as uStack_1ae falls inside
+the zero-padded region, it reads as 0.  This triggers the premature
+"complete" path described in §5.
+
+We have NOT yet confirmed exactly which bytes of the 02 02 frame map to
+uStack_1ae because previous logging only showed the first 20 bytes of each
+frame.  The new build (deployed today) logs all 60 bytes of every 02 02 and
+01 0C frame, so the next test run will give us the byte layout.
+
+────────────────────────────────────────────────────────────────────────────────
+7. EVIDENCE FROM LOGS
+────────────────────────────────────────────────────────────────────────────────
+
+Log LAPTOP-O05OTL4C-6.log  (8107 lines, 845 KB)
+  - Protocol phases visible: PING → FILE-LIST → FILE-SCAN loop →
+    FILE-REQ/META → FILE-CHUNK burst → window boundary → STALL
+  - FILE-CHUNK burst: seq 0x12D5=4821 to 0x209B=8347 → 3527 chunks received
+  - At t=194.53s: last chunk arrives; after that only FILE-ACK (02 02) +
+    DAU-POLL (01 0C) at 500ms intervals, no more chunks ever come
+  - TX 02 04 (NEXT-WIN): fires every ~200 log entries (~50ms) DURING the
+    burst, stops immediately after the burst ends
+  - One TX 228-byte NEXT-WIN at t=192.18s (contains window-range data)
+  - TX 02 05 ABORT at t=242s (FLS30 eventually gives up)
+
+Log LAPTOP-O05OTL4C4.log  (12635 lines, 1.3 MB)
+  - Different file (66 blocks vs 200 blocks in log6)
+  - TX 02 04 is 84 bytes here (vs 60 bytes in log6)
+  - Chunks start at seq 0; log ends mid-download at seq 0x12BC=4796
+  - Pattern: 02 02 alone triggers immediate 84-byte NEXT-WIN (no 01 0C wait)
+
+Key timeline in log6 around the stall point:
+  t=194.4s  RX 1028 bytes [FILE-CHUNK]   (last chunk of window)
+  t=194.5s  RX 60 bytes  [FILE-ACK]      ← 02 02, window boundary
+            *** FLS30 internal: FUN_004379b8(param_1, uStack_1ae=?) called ***
+            *** If uStack_1ae=0 → returns "complete" → no NEXT-WIN sent ***
+  t=194.5s  RX 60 bytes  [DAU-POLL]      ← 01 0C, DAU asks "ready?"
+            (no TX 02 04 response from FLS30 — confirmed from log)
+  t=194.5s+ Only periodic FILE-ACK + DAU-POLL pairs at 500ms, forever
+
+────────────────────────────────────────────────────────────────────────────────
+8. WHAT WE HAVE TRIED / CURRENT STATUS
+────────────────────────────────────────────────────────────────────────────────
+
+Fixed (previous sessions):
+  ✓ Loopback of own TX frames — Npcap promiscuous mode was echoing FLS30's
+    outbound frames back as received frames, causing "thread error" on F1.
+    Fixed with BPF filter (ether src not <our MAC>) + software guard in shim.
+
+Fixed (this session):
+  ✓ Frame type labels in debug log for all protocol frame types
+  ✓ Expanded byte logging: 02 02 and 01 0C now log ALL bytes (was first 20)
+  ✓ Window chunk counter: shim now logs "Window boundary: N chunks before ACK"
+  ✓ Full byte dump for TX 02 04 (NEXT-WIN) and TX 01 06 (FILE-REQ)
+
+NOT YET DONE:
+  □ Confirm uStack_1ae byte offset in 02 02 frame (need one more test run)
+  □ Implement the actual fix once byte offset confirmed:
+      Option A: Shim patches the zero bytes in 02 02 with the correct count
+                (shim counts RX 02 01 chunks per window and injects that count)
+      Option B: Shim injects a synthetic TX 02 04 NEXT-WIN when it sees
+                01 0C and FLS30 hasn't responded within ~300ms
+  □ Test with real DAU hardware to completion
+
+────────────────────────────────────────────────────────────────────────────────
+9. FILES
+────────────────────────────────────────────────────────────────────────────────
+
+C:\Users\Yaswanth\Downloads\claude_shim\packet_shim.c   — shim DLL source
+C:\Users\Yaswanth\Downloads\claude_shim\build_dll.bat   — build script (x86 CL)
+C:\FLS30\BIN\packet_shim.dll                            — deployed shim (latest)
+C:\Users\Yaswanth\Downloads\kongapacket\FLS30.c         — Ghidra decompile of
+                                                          FLS30.exe (full file)
+C:\Users\Yaswanth\OneDrive\Documents\LAPTOP-O05OTL4C-6.log  — test log (stall)
+C:\Users\Yaswanth\OneDrive\Documents\LAPTOP-O05OTL4C4.log   — test log (stall)
+
+Key functions in FLS30.c (Ghidra line numbers):
+  FUN_0040803c  line 11192  — main RX dispatch handler
+  FUN_00437690  line 24494  — sends FILE-REQ, sets state 0xc
+  FUN_004379b8  line 24610  — chunk bitmap checker (THE BUG IS HERE)
+  FUN_00437c0c  line 24687  — sends TX 02 04 NEXT-WIN
+  Case 0xe      line 25253  — FILE-ACK (02 02) handler
+
+────────────────────────────────────────────────────────────────────────────────
+10. THE QUESTION FOR SECOND OPINION
+────────────────────────────────────────────────────────────────────────────────
+
+Given the above:
+
+Q1. Is our hypothesis correct that uStack_1ae=0 (from zero-padded bytes in the
+    DAU's 60-byte minimum-length Ethernet frame) is the cause of the premature
+    "download complete" detection in FUN_004379b8?
+
+Q2. Which of the two fix options is better:
+    (A) Shim intercepts the RX 02 02 frame, counts how many RX 02 01 chunks
+        arrived since the last 02 02, and if the window-count field in the
+        02 02 frame is zero, patches it with that count before delivering to
+        FLS30.
+    (B) Shim watches for RX 01 0C (DAU-POLL) and if FLS30 has not sent TX
+        02 04 (NEXT-WIN) within ~300ms, the shim synthesizes and injects a
+        TX 02 04 frame into the outgoing stream.
+    (C) Something else?
+
+Q3. For Option A: what is the correct chunk count to write into the 02 02
+    frame?  Is it:
+    - Number of 02 01 chunks received since the previous 02 02?
+    - Total chunks received so far in the download?
+    - Something the DAU tells us in the 01 06 FILE-META response?
+
+    From the FILE-META response we see payload[2..3] = C8 00 (= 200 decimal)
+    for one file and 42 00 (= 66 decimal) for another.  This might be the
+    total block count for the file.  Whether the window-count in 02 02 equals
+    this total-block-count or a per-window count is unknown.
+
+================================================================================
+END OF SUMMARY
+================================================================================

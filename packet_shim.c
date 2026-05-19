@@ -1,19 +1,24 @@
 /*
- * packet_shim.c  —  FLS30 Packet Driver Shim  (wpcap edition)
- * =============================================================
- * Intercepts FLS30's Win32 calls to \\.\Packet* and routes them
- * through Npcap's wpcap.dll (pcap_open_live / pcap_sendpacket /
- * pcap_next_ex), which is the only usermode path that works on
- * Windows 11 — NtCreateFile on \Device\NPF_* returns
- * STATUS_OBJECT_NAME_NOT_FOUND (Npcap uses its own IPC, not named
- * NT objects).
+ * packet_shim.c  —  Npcap compatibility shim for DAULink.exe
+ * ===========================================================
+ * DAULink.exe is a legacy 32-bit ground station application that
+ * talks to a physical DAU over raw Ethernet (EtherType 0xAA55).
+ * On Windows 7 it did this through a custom kernel-mode protocol
+ * driver that is no longer supported on Windows 11.
  *
- * Build (x86 to match FLS30.exe WoW64):
- *   cl /nologo /LD /W4 /WX /O2 /DUNICODE /D_UNICODE ^
- *      packet_shim.c ^
- *      /link /DLL /SUBSYSTEM:WINDOWS /MACHINE:X86 ^
- *      kernel32.lib advapi32.lib iphlpapi.lib ws2_32.lib ^
- *      /OUT:packet_shim.dll /DEF:packet_shim.def
+ * This DLL injects into DAULink.exe's process (via AppInit_DLLs
+ * or a launcher script) and patches its import address table so
+ * that every Win32 call aimed at the old driver is silently
+ * redirected here.  The shim then implements the full DAU protocol
+ * in user-space using Npcap's wpcap.dll.  DAULink.exe never knows
+ * anything changed — it still calls CreateFileW, ReadFile,
+ * WriteFile, DeviceIoControl as usual.
+ *
+ * Must be built as x86 (32-bit) to match DAULink.exe's process.
+ * See build_dll.bat for the exact compiler invocation.
+ *
+ * Configuration is in fls30_shim.ini next to DAULink.exe.
+ * See Documentation/CONTRIBUTING.md for the full dev setup guide.
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -29,7 +34,7 @@
 #include <winsvc.h>
 /* iphlpapi.h included for types only — GetAdaptersAddresses loaded dynamically
  * to avoid IPHLPAPI.DLL appearing in our static import table (it causes a
- * ~10-second DllMain stall when injected into FLS30 via remote thread). */
+ * ~10-second DllMain stall when injected via remote thread). */
 #include <iphlpapi.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -108,7 +113,7 @@ static HINSTANCE         g_hDll             = NULL; /* set in DllMain */
 /* pcap adapter handles: FAKE_ADP_BASE + slot index (0..MAX_ADP-1) */
 
 /* ── Pending async ReadFile request ──────────────────────────────
- * FLS30 pipelines multiple overlapped ReadFile calls under sustained
+ * DAULink pipelines multiple overlapped ReadFile calls under sustained
  * download load.  We keep a small circular queue per adapter so no
  * IRP is ever silently overwritten.
  */
@@ -126,7 +131,7 @@ typedef struct {
     BOOL         inUse;
     pcap_t      *pcap;
     /* async ReadFile IRP queue
-     * irpLock guards irpHead/irpTail between FLS30's calling thread
+     * irpLock guards irpHead/irpTail between the application's calling thread
      * (producer) and RecvThread (consumer). */
     CRITICAL_SECTION irpLock;
     RecvReq      irpQueue[IRP_QUEUE_DEPTH];
@@ -140,30 +145,30 @@ typedef struct {
     DWORD        windowMinSeq;  /* lowest  seq# seen in current window  */
     DWORD        windowMaxSeq;  /* highest seq# seen in current window  */
 
-    /* Retransmit injection
-     * When FLS30 sends a large NEXT-WIN retransmit request, the DAU sometimes
-     * skips the confirming FILE-ACK for the retransmit window and jumps
-     * directly to FILE-ACK for window+1, leaving FLS30 waiting forever.
-     * The shim detects this and injects a synthetic FILE-ACK for the
-     * retransmit window so FLS30 can declare it complete.
+    /* Retransmit tracking (RetxWait)
+     * When the application sends RETRANSMIT NEXT-WIN (missing > 0), the DAU
+     * will resend chunks for that window.  We hold any FILE-ACK for a future
+     * window until the confirming FILE-ACK for the retransmit window arrives —
+     * delivering an out-of-order FILE-ACK would confuse the application's
+     * state machine and cause a stall or ABORT.
      *
      * retxPending/retxWindow written by Hook_WriteFile, read by RecvThread.
      * On x86/x64 strong-ordering: write retxWindow before retxPending=TRUE. */
     volatile LONG retxPending;  /* 1 after RETRANSMIT NEXT-WIN TX, 0 after DAU confirms */
     volatile WORD retxWindow;   /* window number whose retransmit is in flight          */
 
-    /* Deferred frame: the real FILE-ACK held back while the synthetic is
-     * delivered first.  Delivered to the next IRP after the synthetic. */
+    /* Deferred frame buffer.
+     * Holds a FILE-ACK for window W+N while we are still waiting for the
+     * confirming FILE-ACK for window W.  1514 bytes = max Ethernet frame.
+     * Delivered by the outer IRP loop once retxPending is cleared. */
     BOOL  deferredPending;
     BYTE  deferredFrame[1514];
     DWORD deferredFrameLen;
 
     /* Live-view NEXT-WIN auto-forwarding.
-     * The DAU sends live telemetry in bursts of ~64 frames then waits for
-     * a NEXT-WIN before the next burst.  FLS30's Delphi timer takes 1–7 s
-     * to fire the NEXT-WIN.  When set, RecvThread waits at most
-     * LIVE_NEXTWIN_TIMEOUT_MS for FLS30 to send its own NEXT-WIN before
-     * sending one on FLS30's behalf. */
+     * The DAU sends live telemetry in bursts then waits for NEXT-WIN.
+     * The application's internal timer can take 1–7 s to send it.
+     * RecvThread waits LIVE_NEXTWIN_TIMEOUT_MS then sends it automatically. */
     volatile BOOL liveDataPendingNextWin;
     BYTE          dauMac[6];   /* DAU source MAC learned from first RX frame */
 } AdpEntry;
@@ -172,7 +177,7 @@ static AdpEntry g_Adp[MAX_ADP];
 
 /* ── Global state ─────────────────────────────────────────────── */
 static WCHAR g_NpcapGuid[MAX_GUID_LEN]    = {0};
-static WCHAR g_AdapterName[128]           = L"FLS30DAU";
+static WCHAR g_AdapterName[128]           = L"DAULink";
 static BYTE  g_Mac[6]                     = {0};
 static BOOL  g_Initialised                = FALSE;
 static BOOL  g_TestMode                   = FALSE;
@@ -191,7 +196,7 @@ static const BYTE k_FakeDauMac[6]         = {0x00,0xDE,0xAD,0xDA,0x7F,0x00};
  * mutex unlike OutputDebugStringW).
  * High-frequency per-chunk events (FILE-CHUNK, ReadFile queued)
  * are suppressed to keep the file small and eliminate DebugView
- * overhead that was causing disk-thread backup in FLS30.
+ * overhead that was causing disk-thread backup in the application.
  * Control-plane events (FILE-ACK, NEXT-WIN, retransmit, errors)
  * are written to both the file and OutputDebugStringW so that
  * DebugView still works for real-time monitoring.
@@ -380,6 +385,19 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved)
 
 /* ══════════════════════════════════════════════════════════════
  * ShimInit
+ * ─────────────────────────────────────────────────────────────
+ * Called once from DllMain when the DLL attaches to the process.
+ * Does two things:
+ *   1. Loads wpcap.dll and resolves all the pcap function pointers
+ *      we need.  If wpcap.dll is not found, the shim still loads
+ *      but will not be able to do any network I/O.
+ *   2. Reads fls30_shim.ini to pick up the adapter name/GUID,
+ *      TestMode flag, and the Logging on/off switch.
+ *
+ * After this returns, InstallHooks() patches the IAT and the shim
+ * is fully active.  Any failure here is non-fatal — the shim
+ * logs a warning and continues, which is better than crashing
+ * DAULink.exe on startup.
  * ══════════════════════════════════════════════════════════════ */
 static BOOL ShimInit(void)
 {
@@ -427,7 +445,7 @@ static BOOL ShimInit(void)
             Log(L"[PacketShim] WARNING: no Npcap adapter found\n");
     }
 
-    GetPrivateProfileStringW(L"Adapter", L"FriendlyName", L"FLS30DAU",
+    GetPrivateProfileStringW(L"Adapter", L"FriendlyName", L"DAULink",
                              g_AdapterName, 128, iniPath);
     g_TestMode = (GetPrivateProfileIntW(L"Debug", L"TestMode", 0, iniPath) != 0);
     if (g_TestMode) Log(L"[PacketShim] *** TEST MODE ENABLED — synthetic DAU frames ***\n");
@@ -463,12 +481,12 @@ static BOOL ShimInit(void)
  * remembered on every subsequent launch.
  *
  * Uses PeekMessage + WaitMessage instead of PostQuitMessage so we
- * never post WM_QUIT into FLS30's thread message queue.
+ * never post WM_QUIT into the application's thread message queue.
  * ══════════════════════════════════════════════════════════════ */
 #define ADPPICK_LB      2001
 #define ADPPICK_OK      2002
 #define ADPPICK_CANCEL  2003
-#define ADPPICK_CLSNAME L"FLS30ShimAdpPick"
+#define ADPPICK_CLSNAME L"PacketShimAdpPick"
 
 typedef struct {
     pcap_if_t **devs;
@@ -490,7 +508,7 @@ static LRESULT CALLBACK AdpPickWndProc(HWND hwnd, UINT msg,
 
         /* Instruction label */
         CreateWindowExW(0, L"STATIC",
-            L"FLS30 DAU first-run setup\r\n"
+            L"PacketShim — first-run adapter setup\r\n"
             L"Select the Ethernet adapter that connects to the DAU.\r\n"
             L"Your choice is saved to fls30_shim.ini and won't be asked again.",
             WS_CHILD | WS_VISIBLE | SS_LEFT,
@@ -555,7 +573,7 @@ static LRESULT CALLBACK AdpPickWndProc(HWND hwnd, UINT msg,
 
     case WM_DESTROY:
         /* Wake the message loop WITHOUT posting WM_QUIT (which would
-         * be picked up by FLS30's own message pump later). */
+         * be picked up by the application's own message pump later). */
         PostThreadMessageW(GetCurrentThreadId(), WM_NULL, 0, 0);
         return 0;
     }
@@ -577,7 +595,7 @@ static int RunAdpPickWindow(pcap_if_t **devs, int count)
     HWND hwnd = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_DLGMODALFRAME,
         ADPPICK_CLSNAME,
-        L"FLS30 DAU — Select Network Adapter",
+        L"PacketShim — Select Network Adapter",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
         CW_USEDEFAULT, CW_USEDEFAULT, 500, 320,
         NULL, NULL, g_hDll, &ctx);
@@ -587,7 +605,7 @@ static int RunAdpPickWindow(pcap_if_t **devs, int count)
     UpdateWindow(hwnd);
 
     /* Pump messages until the window signals done.
-     * We never call PostQuitMessage so FLS30's pump is unaffected. */
+     * We never call PostQuitMessage so the application's pump is unaffected. */
     MSG m;
     while (!ctx.done) {
         if (PeekMessageW(&m, NULL, 0, 0, PM_REMOVE)) {
@@ -626,7 +644,7 @@ static void ShowAdapterPicker(LPCWSTR iniPath)
         MessageBoxW(NULL,
             L"No Ethernet adapters found via Npcap.\r\n"
             L"Check that Npcap is installed and try again.",
-            L"FLS30 DAU — No Adapters",
+            L"PacketShim — No Adapters Found",
             MB_OK | MB_ICONWARNING | MB_TOPMOST);
         g_pcapFreeAllDevs(alldevs);
         return;
@@ -761,7 +779,7 @@ static HANDLE OpenPcapHandle(DWORD acc, DWORD share, DWORD flags)
     /* Apply BPF filter:
      *   - Only pass EtherType 0xAA55 frames
      *   - Exclude frames whose SOURCE MAC is our own NIC (Npcap loopback
-     *     of our outbound TX frames — FLS30 must never see its own frames
+     *     of our outbound TX frames — the application must never see its own frames
      *     echoed back or its state machine confuses them for DAU replies).
      */
     if (g_pcapCompile && g_pcapSetFilter && g_pcapFreeCode) {
@@ -853,16 +871,22 @@ static void BuildSynthFrame(BYTE *out60, const BYTE *dst, const BYTE *src,
 }
 
 /* ── Live-view NEXT-WIN auto-forwarding ───────────────────────────────────
- * How long RecvThread waits for FLS30 to send its own NEXT-WIN after a
- * LIVE-DATA burst ends before the shim sends one on FLS30's behalf.
- * 50 ms is fast enough to achieve ~1.6 Hz refresh (vs 1–7 s without this)
- * while still giving FLS30 a brief window to respond naturally. */
+ * When the DAU sends a burst of LIVE-DATA (03 03) frames it waits for a
+ * NEXT-WIN before sending the next burst.  DAULink.exe has a Delphi timer
+ * that fires that NEXT-WIN, but it can take 1–7 seconds depending on load.
+ * The shim auto-sends NEXT-WIN on DAULink.exe's behalf if it hasn't seen
+ * one within LIVE_NEXTWIN_TIMEOUT_MS.  This keeps live telemetry flowing
+ * at roughly 1.6 Hz instead of once every few seconds.
+ *
+ * If DAULink.exe does send its own NEXT-WIN before the timer fires, we
+ * cancel the auto-send flag in Hook_WriteFile so we don't double-send. */
 #define LIVE_NEXTWIN_TIMEOUT_MS  50
 
 static void SendLiveNextWin(AdpEntry *a)
 {
-    /* Build the same NEXT-WIN frame FLS30 would send:
-     * dst=DAU MAC, src=our MAC, EtherType=AA55, type=02 04, rest=zeros. */
+    /* Build the same NEXT-WIN frame the application would send:
+     * dst=DAU MAC, src=our MAC, EtherType=0xAA55, type=02 04, rest=zeros
+     * (zeros in the missing-count field means COMPLETE, not retransmit). */
     BYTE frame[60];
     ZeroMemory(frame, sizeof(frame));
     CopyMemory(frame + 0, a->dauMac,  6);   /* dst = DAU */
@@ -877,8 +901,31 @@ static void SendLiveNextWin(AdpEntry *a)
 }
 
 /* ══════════════════════════════════════════════════════════════
- * RecvThread — background loop that drains pcap for async ReadFile
- * In TestMode: generates synthetic DAU frames instead of real pcap.
+ * RecvThread
+ * ─────────────────────────────────────────────────────────────
+ * One instance of this thread runs per open adapter handle.  Its
+ * job is to sit in a pcap_next_ex loop, pick up incoming frames,
+ * apply the protocol state machine, and hand matching frames to
+ * whatever ReadFile request DAULink.exe has queued up.
+ *
+ * The outer loop services IRP requests one at a time:
+ *   1. Wait for DAULink.exe to post a ReadFile (startEvt).
+ *   2. If there is a deferred FILE-ACK from a previous retransmit
+ *      cycle, deliver that first before touching pcap.
+ *   3. Otherwise, drain pcap_next_ex until a frame arrives.
+ *   4. Apply retransmit state (RetxWait) and LiveView NEXT-WIN logic.
+ *   5. Copy the frame into the caller's buffer and signal hEvent.
+ *   6. Go back to step 1.
+ *
+ * When TestMode is active the pcap path is replaced entirely by a
+ * small synthetic frame generator so you can drive DAULink.exe's
+ * state machine without any physical hardware connected.
+ *
+ * Thread safety: each AdpEntry has exactly one RecvThread.  Fields
+ * that are only read/written by this thread (windowMinSeq, windowMaxSeq,
+ * deferredPending, etc.) need no locking.  retxPending is a volatile
+ * LONG that can be written by Hook_WriteFile on another thread, so
+ * reads of it use the hardware memory model (x86 strong ordering).
  * ══════════════════════════════════════════════════════════════ */
 static DWORD WINAPI RecvThread(LPVOID param)
 {
@@ -908,7 +955,7 @@ static DWORD WINAPI RecvThread(LPVOID param)
 
             if (!wantData && !wantPing) { Sleep(10); continue; }
 
-            /* Wait up to 50 ms for FLS30 to post a ReadFile */
+            /* Wait up to 50 ms for the application to post a ReadFile */
             if (WaitForSingleObject(a->startEvt, 50) != WAIT_OBJECT_0)
                 continue;
             if (a->stopThread) continue;
@@ -948,15 +995,15 @@ static DWORD WINAPI RecvThread(LPVOID param)
     while (!a->stopThread) {
         /* Wait for Hook_ReadFile to post a pending IRP.
          * If a LIVE-DATA burst just ended (liveDataPendingNextWin), use a
-         * short timeout so the shim can auto-send NEXT-WIN if FLS30 is slow. */
+         * short timeout so the shim can auto-send NEXT-WIN if the application is slow. */
         DWORD waitMs = a->liveDataPendingNextWin
                        ? LIVE_NEXTWIN_TIMEOUT_MS
                        : 200;
         DWORD wr = WaitForSingleObject(a->startEvt, waitMs);
         if (wr == WAIT_TIMEOUT) {
             if (a->liveDataPendingNextWin) {
-                /* FLS30 hasn't responded within the timeout window — send
-                 * NEXT-WIN on FLS30's behalf to keep the DAU streaming. */
+                /* Application hasn't responded within the timeout window —
+                 * send NEXT-WIN on its behalf to keep the DAU streaming. */
                 a->liveDataPendingNextWin = FALSE;
                 SendLiveNextWin(a);
             }
@@ -980,7 +1027,7 @@ static DWORD WINAPI RecvThread(LPVOID param)
          * When a FILE-ACK for W+N arrived while retxPending was set for W,
          * RecvThread stashed it here and kept waiting for the real FILE-ACK W.
          * Once FILE-ACK W was delivered (clearing retxPending), the next IRP
-         * lands here and we deliver the deferred W+N frame so FLS30 can
+         * lands here and we deliver the deferred W+N frame so the application can
          * advance normally. */
         if (a->deferredPending) {
             a->deferredPending = FALSE;
@@ -1013,16 +1060,16 @@ static DWORD WINAPI RecvThread(LPVOID param)
                 if (hdr->caplen >= 16) {
                     rxT0 = pkt[14]; rxT1 = pkt[15];
                     if      (rxT0==0x01 && rxT1==0x01) ftype = L"PING";
-                    else if (rxT0==0x01 && rxT1==0x02) ftype = L"FILE-LIST";  /* DAU→FLS30: file list resp    */
-                    else if (rxT0==0x01 && rxT1==0x05) ftype = L"FILE-SCAN";  /* DAU→FLS30: file meta resp    */
-                    else if (rxT0==0x01 && rxT1==0x06) ftype = L"FILE-META";  /* DAU→FLS30: download meta     */
+                    else if (rxT0==0x01 && rxT1==0x02) ftype = L"FILE-LIST";  /* DAU→app: file list resp    */
+                    else if (rxT0==0x01 && rxT1==0x05) ftype = L"FILE-SCAN";  /* DAU→app: file meta resp    */
+                    else if (rxT0==0x01 && rxT1==0x06) ftype = L"FILE-META";  /* DAU→app: download meta     */
                     else if (rxT0==0x01 && rxT1==0x07) ftype = L"LIVE-CTRL";
                     else if (rxT0==0x01 && rxT1==0x0B) ftype = L"LIVE-CTRL2";
-                    else if (rxT0==0x01 && rxT1==0x0C) ftype = L"DAU-POLL";   /* DAU→FLS30: next-win ready?   */
-                    else if (rxT0==0x02 && rxT1==0x01) ftype = L"FILE-CHUNK"; /* DAU→FLS30: file data chunk   */
-                    else if (rxT0==0x02 && rxT1==0x02) ftype = L"FILE-ACK";   /* DAU→FLS30: window boundary   */
-                    else if (rxT0==0x02 && rxT1==0x03) ftype = L"FILE-DONE";  /* DAU→FLS30: transfer complete */
-                    else if (rxT0==0x02 && rxT1==0x05) ftype = L"FILE-ERR";   /* DAU→FLS30: download error    */
+                    else if (rxT0==0x01 && rxT1==0x0C) ftype = L"DAU-POLL";   /* DAU→app: next-win ready?   */
+                    else if (rxT0==0x02 && rxT1==0x01) ftype = L"FILE-CHUNK"; /* DAU→app: file data chunk   */
+                    else if (rxT0==0x02 && rxT1==0x02) ftype = L"FILE-ACK";   /* DAU→app: window boundary   */
+                    else if (rxT0==0x02 && rxT1==0x03) ftype = L"FILE-DONE";  /* DAU→app: transfer complete */
+                    else if (rxT0==0x02 && rxT1==0x05) ftype = L"FILE-ERR";   /* DAU→app: download error    */
                     else if (rxT0==0x03 && rxT1==0x03) ftype = L"LIVE-DATA";
                 }
 
@@ -1056,10 +1103,10 @@ static DWORD WINAPI RecvThread(LPVOID param)
                  *   [24..25] = chunk count for this window (LE WORD)
                  *   [26..]   = sensor/status payload
                  *
-                 * When the DAU skips the confirming FILE-ACK for a retransmit
-                 * window, the shim injects a synthetic one (count=0 so FLS30
-                 * calls FUN_004379b8(obj,0) → instant "complete") and defers
-                 * the real next-window FILE-ACK to the following IRP delivery.
+                 * If the DAU skips the confirming FILE-ACK for the retransmit
+                 * window and jumps to the next window instead, we stash the
+                 * premature FILE-ACK in deferredFrame and wait — delivering it
+                 * early would confuse the application's state machine.
                  * ──────────────────────────────────────────────────────────── */
 
                 if (rxT0==0x02 && rxT1==0x02) {
@@ -1083,37 +1130,26 @@ static DWORD WINAPI RecvThread(LPVOID param)
                         LogFile(L"[PacketShim] FILE-ACK: window=0x%04X count=%u\n",
                             (DWORD)ackWin, (DWORD)ackCount);
 
-                        /* ── Retransmit window tracking ──────────────────────
-                         * retxPending is set when FLS30 sends a RETRANSMIT
-                         * NEXT-WIN for window W (Hook_WriteFile).  We wait for
-                         * the DAU to send the confirming FILE-ACK W directly
-                         * before delivering it to FLS30.
+                        /* ── Retransmit window tracking (RetxWait) ──────────
+                         * retxPending is set when the application sends a
+                         * RETRANSMIT NEXT-WIN for window W (Hook_WriteFile).
+                         * We wait for the DAU to confirm via FILE-ACK W before
+                         * delivering anything to the application.
                          *
                          * If the DAU skips W and sends FILE-ACK W+N first, we
-                         * stash W+N as deferred and keep waiting.  We must NOT
-                         * synthesise a fake FILE-ACK W: FLS30's ring buffer for
-                         * W may still be partially filled (retransmit in
-                         * progress), so running FUN_004379b8 on it early causes
-                         * FLS30 to go completely silent (no RETRANSMIT, no
-                         * COMPLETE) and eventually ABORT.
+                         * stash W+N as deferred and keep waiting.  Delivering
+                         * W+N while the application is still expecting W would
+                         * confuse its state machine and cause it to go silent —
+                         * no further RETRANSMIT or COMPLETE, eventual ABORT.
                          * ──────────────────────────────────────────────────── */
                         if (a->retxPending && ackWin > a->retxWindow) {
-                            /* FILE-ACK for W+N arrived while still waiting for
-                             * the DAU to confirm window W's retransmit via a
-                             * direct FILE-ACK W.
-                             *
-                             * Do NOT synthesise anything — FLS30's ring buffer
-                             * for W is still being filled by the retransmit and
-                             * any synthetic FILE-ACK W would cause FUN_004379b8
-                             * to run on an incomplete ring, leaving FLS30 silent.
-                             *
-                             * Instead: stash W+N as deferred, keep retxPending=1,
-                             * and continue the pcap loop.  When the DAU eventually
-                             * sends the real FILE-ACK W (ackWin==retxWindow path
-                             * below), we clear retxPending, deliver FILE-ACK W to
-                             * FLS30, and the deferred W+N frame is picked up by
-                             * the IRP-loop at the top of RecvThread on the next
-                             * iteration. */
+                            /* FILE-ACK W+N arrived while we are still waiting
+                             * for the confirming FILE-ACK W.  The application
+                             * is not ready for W+N yet — stash it and keep
+                             * waiting.  When FILE-ACK W finally arrives, we
+                             * deliver it, clear retxPending, and the deferred
+                             * W+N is picked up by the outer IRP loop on the
+                             * very next iteration. */
                             DWORD copyLen = hdr->caplen < sizeof(a->deferredFrame)
                                             ? hdr->caplen
                                             : (DWORD)sizeof(a->deferredFrame);
@@ -1141,7 +1177,7 @@ static DWORD WINAPI RecvThread(LPVOID param)
                 /* ── RX frame log (skip FILE-CHUNK to prevent DebugView storm) ──
                  * FILE-CHUNK (02 01) frames arrive at wire rate (~100/window).
                  * Logging every one fills DebugView and causes ~80 ms/chunk
-                 * overhead that starves FLS30's disk thread.  The window
+                 * overhead that can starve the application's disk write thread.  The window
                  * boundary message already summarises the chunk count and seq
                  * range, so individual chunk logs add no diagnostic value.
                  * All other frame types (FILE-ACK, DAU-POLL, NEXT-WIN, etc.)
@@ -1169,7 +1205,7 @@ static DWORD WINAPI RecvThread(LPVOID param)
                 /* ── DAU MAC learning & live-view NEXT-WIN trigger ───────
                  * Learn the DAU's source MAC from the first received frame.
                  * When a LIVE-DATA (03 03) frame is delivered, set the
-                 * pending flag so RecvThread auto-sends NEXT-WIN if FLS30's
+                 * pending flag so RecvThread auto-sends NEXT-WIN if the application's
                  * Delphi timer doesn't fire within LIVE_NEXTWIN_TIMEOUT_MS. */
                 if (hdr->caplen >= 12 &&
                     (a->dauMac[0] | a->dauMac[1] | a->dauMac[2] |
@@ -1202,14 +1238,16 @@ static DWORD WINAPI RecvThread(LPVOID param)
 
 /* ══════════════════════════════════════════════════════════════
  * BuildEnumResponse
- * Format: [DWORD count] [WCHAR name\0] [WCHAR desc\0] [\0]
+ * ─────────────────────────────────────────────────────────────
+ * Formats the response buffer for IOCTL_ENUM_ADAPTERS:
+ *   [DWORD count=1] [WCHAR name\0] [WCHAR desc\0] [\0]
  *
- * FLS30's FUN_004731c8 builds the device path as:
- *   wsprintfW(buf, L"\\.\%s", desc_ptr + 0x18)
- * i.e. it skips the first 12 WCHARs (24 bytes) of the desc string.
- * We prefix the desc with "\Device\NPF_" (exactly 12 chars) so
- * that desc_ptr+12 = g_AdapterName → FLS30 opens "\\.\FLS30DAU"
- * which our IsAdapterDev hook intercepts.
+ * The application parses the description string and extracts the
+ * adapter name from it by skipping the first 12 wide characters.
+ * We prefix the desc with "\Device\NPF_" (exactly 12 WCHARs) so
+ * that the extracted portion is g_AdapterName — the name the
+ * application will then pass back to CreateFileW as "\\.\<name>",
+ * which IsAdapterDev recognises and intercepts.
  * ══════════════════════════════════════════════════════════════ */
 static BOOL BuildEnumResponse(PVOID buf, ULONG len, PULONG written)
 {
@@ -1271,6 +1309,23 @@ static PfnCloseServiceHandle g_OrigCSH   = NULL;
 
 /* ══════════════════════════════════════════════════════════════
  * Hook_CreateFileW
+ * ─────────────────────────────────────────────────────────────
+ * DAULink.exe opens three types of paths we care about:
+ *   1. \\.\Packet           — the "control" device it uses to list
+ *                             adapters.  We return a fake handle and
+ *                             handle the subsequent DeviceIoControl
+ *                             calls ourselves.
+ *   2. \\.\Packet_<name>    — opened first with access=0 just to
+ *                             query the MAC address via IOCTL.
+ *                             Return a different fake handle.
+ *   3. \\.\Packet_<name>    — opened again with GENERIC_READ|WRITE
+ *                             for the actual data transfer.  This
+ *                             is where we call pcap_open_live and
+ *                             spin up a RecvThread.
+ *
+ * Anything that does not match these patterns is passed straight
+ * through to the real CreateFileW — we do not want to intercept
+ * ordinary file or registry opens.
  * ══════════════════════════════════════════════════════════════ */
 HANDLE WINAPI Hook_CreateFileW(
     LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
@@ -1283,11 +1338,11 @@ HANDLE WINAPI Hook_CreateFileW(
         return FAKE_CONTROL_HANDLE;
     }
 
-    /* MAC-query fingerprint (FLS30.c FUN_00473262 line 50285):
-     *   CreateFileW(<any>, 0, 1, NULL, 3, 0, (HANDLE)0xFFFFFFFF)
-     * hTmpl == INVALID_HANDLE_VALUE with access==0 is unique to this call.
-     * FLS30 opens desc_ptr+0x26 which may be any short string (e.g. "U")
-     * rather than our adapter name, so we cannot rely on IsAdapterDev here. */
+    /* MAC-query fingerprint: the application opens the adapter device
+     * with dwDesiredAccess=0 and hTemplate=INVALID_HANDLE_VALUE specifically
+     * for the MAC address IOCTL, using a short path string that may not match
+     * our configured adapter name.  Matching on these two parameters is more
+     * reliable than matching on the path alone. */
     if (dwDesiredAccess == 0 && hTmpl == (HANDLE)(ULONG_PTR)0xFFFFFFFFUL) {
         Log(L"[PacketShim] CreateFileW(%s acc=0 tmpl=-1) → FAKE_MAC_HANDLE\n", lpFileName);
         return FAKE_MAC_HANDLE;
@@ -1305,6 +1360,20 @@ pt:
 
 /* ══════════════════════════════════════════════════════════════
  * Hook_DeviceIoControl
+ * ─────────────────────────────────────────────────────────────
+ * Handles the two IOCTLs DAULink.exe sends to the packet driver:
+ *
+ *   IOCTL_ENUM_ADAPTERS (0x8000000C) — sent to the control handle.
+ *   DAULink.exe wants a list of available adapters as a counted
+ *   DWORD followed by a double-NUL-terminated wide string list.
+ *   We reply with the single adapter name from fls30_shim.ini.
+ *
+ *   IOCTL_GET_MAC (0x170002) — sent to the MAC-query handle.
+ *   DAULink.exe wants the 6-byte hardware MAC of the NIC.  We
+ *   return whatever FetchMac() loaded at startup.
+ *
+ * Everything else on a fake handle is logged and ignored.
+ * DeviceIoControl calls on real (non-fake) handles pass through.
  * ══════════════════════════════════════════════════════════════ */
 BOOL WINAPI Hook_DeviceIoControl(
     HANDLE hDev, DWORD dwCode,
@@ -1336,7 +1405,7 @@ BOOL WINAPI Hook_DeviceIoControl(
         return TRUE;
     }
 
-    /* NDIS IOCTLs — FLS30 uses WriteFile for actual sends; treat as no-ops */
+    /* NDIS IOCTLs — the application uses WriteFile for actual sends; treat these as no-ops */
     if (dwCode == IOCTL_NDIS_SEND || dwCode == IOCTL_NDIS_SEND_LOOPBACK ||
         dwCode == IOCTL_NDIS_RESET) {
         if (pRet) *pRet = 0;
@@ -1348,6 +1417,14 @@ BOOL WINAPI Hook_DeviceIoControl(
 
 /* ══════════════════════════════════════════════════════════════
  * Hook_CloseHandle
+ * ─────────────────────────────────────────────────────────────
+ * Cleans up when DAULink.exe is done with an adapter handle.
+ * The most important thing here is stopping RecvThread cleanly —
+ * we set stopThread, call pcap_breakloop to unblock pcap_next_ex,
+ * then wait up to 5 seconds for the thread to exit before we
+ * release the pcap handle.  Skipping this wait causes crashes
+ * because pcap_close on a handle still in use frees memory the
+ * thread is touching.
  * ══════════════════════════════════════════════════════════════ */
 BOOL WINAPI Hook_CloseHandle(HANDLE h)
 {
@@ -1377,7 +1454,29 @@ BOOL WINAPI Hook_CloseHandle(HANDLE h)
 }
 
 /* ══════════════════════════════════════════════════════════════
- * Hook_WriteFile — pcap_sendpacket for adapter handles
+ * Hook_WriteFile
+ * ─────────────────────────────────────────────────────────────
+ * Intercepts outbound frames from DAULink.exe and forwards them
+ * to the wire via pcap_sendpacket.  But before forwarding, we
+ * inspect the frame type so we can track protocol state:
+ *
+ *   NEXT-WIN (02 04) with missing > 0  →  RETRANSMIT request.
+ *     Set retxPending=1, record retxWindow.  RecvThread will now
+ *     hold any FILE-ACK for a future window until the confirming
+ *     FILE-ACK for this window arrives.
+ *
+ *   NEXT-WIN (02 04) with missing = 0  →  COMPLETE signal.
+ *     If retxPending is active and this COMPLETE is for a window
+ *     older than retxWindow, it is a spurious ghost frame from the
+ *     application's async loop completing the previous window after
+ *     the retransmit was already requested.  DROP IT — if the DAU
+ *     sees this COMPLETE it will skip the retransmit and advance,
+ *     which desynchronises the transfer and causes an ABORT.
+ *
+ *   Everything else goes to the wire unchanged.
+ *
+ * TestMode intercept: PING (01 01) frames are caught here and a
+ * synthetic reply is queued for RecvThread to deliver back.
  * ══════════════════════════════════════════════════════════════ */
 BOOL WINAPI Hook_WriteFile(
     HANDLE hFile, LPCVOID lpBuf, DWORD nBytes,
@@ -1402,19 +1501,19 @@ BOOL WINAPI Hook_WriteFile(
         }
 
         /* Log outbound frame — full dump for NEXT-WIN (02 04) so we can
-         * see what window range FLS30 is requesting; first 20 bytes for others */
+         * see what window range the application is requesting; first 20 bytes for others */
         if (nBytes >= 16) {
             const BYTE *fp = (const BYTE*)lpBuf;
             BYTE t0=fp[14], t1=fp[15];
             LPCWSTR txtype = L"?";
             if      (t0==0x01&&t1==0x01) txtype=L"PING";
-            else if (t0==0x01&&t1==0x02) txtype=L"FILE-LIST";  /* FLS30→DAU: list files             */
-            else if (t0==0x01&&t1==0x05) txtype=L"FILE-SCAN";  /* FLS30→DAU: per-file meta request  */
-            else if (t0==0x01&&t1==0x06) txtype=L"FILE-REQ";   /* FLS30→DAU: request file download  */
+            else if (t0==0x01&&t1==0x02) txtype=L"FILE-LIST";  /* app→DAU: list files             */
+            else if (t0==0x01&&t1==0x05) txtype=L"FILE-SCAN";  /* app→DAU: per-file meta request  */
+            else if (t0==0x01&&t1==0x06) txtype=L"FILE-REQ";   /* app→DAU: request file download  */
             else if (t0==0x01&&t1==0x07) txtype=L"LIVE-CTRL";
             else if (t0==0x01&&t1==0x0B) txtype=L"LIVE-CTRL2";
-            else if (t0==0x02&&t1==0x04) txtype=L"NEXT-WIN";   /* FLS30→DAU: send next window       */
-            else if (t0==0x02&&t1==0x05) txtype=L"ABORT";      /* FLS30→DAU: abort transfer         */
+            else if (t0==0x02&&t1==0x04) txtype=L"NEXT-WIN";   /* app→DAU: send next window       */
+            else if (t0==0x02&&t1==0x05) txtype=L"ABORT";      /* app→DAU: abort transfer         */
             else if (t0==0x03&&t1==0x03) txtype=L"LIVE-DATA";
             /* Full dump for NEXT-WIN and FILE-REQ; first 20 bytes otherwise */
             BOOL txFull = (t0==0x02&&t1==0x04) || (t0==0x01&&t1==0x06);
@@ -1435,14 +1534,14 @@ BOOL WINAPI Hook_WriteFile(
             /* ── NEXT-WIN (02 04) processing ──────────────────────────────────
              * Two sub-cases:
              *   missingCnt > 0 → RETRANSMIT: track the window, set retxPending.
-             *   missingCnt == 0 → COMPLETE:   may be spurious (FLS30 bug — the
-             *     second vmethod in case-0xe's RETRANSMIT branch fires a COMPLETE
-             *     NEXT-WIN for the previous window immediately after sending the
-             *     RETRANSMIT NEXT-WIN for the current window).  If retxPending is
-             *     set and this COMPLETE is for a window earlier than retxWindow,
-             *     DROP it — the DAU must not see it or it will skip the retransmit
-             *     of retxWindow and advance, causing FLS30's guard (0xed8) to
-             *     permanently fail for all subsequent windows.
+             *   missingCnt == 0 → COMPLETE:   may be spurious — the application's
+             *     async loop can complete the previous window and send a COMPLETE
+             *     NEXT-WIN for it moments after we already sent a RETRANSMIT for
+             *     the current window.  If retxPending is set and this COMPLETE is
+             *     for a window earlier than retxWindow,
+             *     DROP it — the DAU must not see it or it will abandon the
+             *     retransmit, advance to the next window, and the transfer will
+             *     desynchronise and eventually ABORT.
              * ─────────────────────────────────────────────────────────────────── */
             if (t0==0x02 && t1==0x04 && nBytes >= 26) {
                 const BYTE *fp2 = (const BYTE*)lpBuf;
@@ -1455,18 +1554,19 @@ BOOL WINAPI Hook_WriteFile(
                     Log(L"[PacketShim] RetxTrack: window=0x%04X missing=%u — awaiting DAU retransmit\n",
                         (DWORD)a->retxWindow, (DWORD)missingCnt);
                 } else {
-                    /* COMPLETE NEXT-WIN from FLS30 — cancel live-view auto-send
-                     * so RecvThread doesn't double-send for the same cycle. */
+                    /* COMPLETE NEXT-WIN from the application — cancel the
+                     * live-view auto-send flag so RecvThread doesn't also
+                     * send one for the same cycle. */
                     if (a->liveDataPendingNextWin) {
                         a->liveDataPendingNextWin = FALSE;
-                        LogFile(L"[PacketShim] LiveView: FLS30 sent own NEXT-WIN — auto-send cancelled\n");
+                        LogFile(L"[PacketShim] LiveView: application sent own NEXT-WIN — auto-send cancelled\n");
                     }
                 }
                 if (a->retxPending && winNum < a->retxWindow) {
                     /* SPURIOUS COMPLETE for a window < retxWindow — DROP IT.
-                     * This is the second-vmethod ghost frame from FLS30's
-                     * RETRANSMIT branch.  Swallow it silently so the DAU
-                     * honours the preceding RETRANSMIT request. */
+                     * The application's async loop finished processing the
+                     * previous window just after we sent a retransmit request.
+                     * Suppress this so the DAU honours the retransmit. */
                     Log(L"[PacketShim] *** DROPPING spurious COMPLETE NEXT-WIN win=0x%04X (retxWindow=0x%04X) — not sending to DAU ***\n",
                         (DWORD)winNum, (DWORD)a->retxWindow);
                     if (lpWritten) *lpWritten = nBytes;
@@ -1475,7 +1575,7 @@ BOOL WINAPI Hook_WriteFile(
                         lpOv->Internal     = 0;
                         if (lpOv->hEvent) SetEvent(lpOv->hEvent);
                     }
-                    return TRUE;   /* lie to FLS30: "sent OK" — packet eaten */
+                    return TRUE;   /* tell the application "sent OK" — packet silently dropped */
                 }
             }
         }
@@ -1498,7 +1598,25 @@ BOOL WINAPI Hook_WriteFile(
 }
 
 /* ══════════════════════════════════════════════════════════════
- * Hook_ReadFile — async via RecvThread, or sync blocking loop
+ * Hook_ReadFile
+ * ─────────────────────────────────────────────────────────────
+ * DAULink.exe keeps several overlapped ReadFile requests in flight
+ * simultaneously to avoid stalling when the DAU sends a burst of
+ * frames.  We handle this with an 8-slot circular IRP queue:
+ *
+ *   - Push the request (buffer pointer + OVERLAPPED) onto the tail.
+ *   - Return ERROR_IO_PENDING immediately so DAULink.exe can post
+ *     the next request without waiting.
+ *   - RecvThread pops the head when a frame arrives and signals
+ *     OVERLAPPED.hEvent so DAULink.exe's WaitForSingleObject wakes.
+ *
+ * If the queue fills up (all 8 slots busy) we reject the request
+ * with ERROR_TOO_MANY_CMDS.  In practice this never happens on the
+ * target hardware but might on a much faster machine.
+ *
+ * Non-overlapped (synchronous) ReadFile calls are not expected from
+ * DAULink.exe on the data handle, but are handled as a fallback by
+ * looping on pcap_next_ex directly.
  * ══════════════════════════════════════════════════════════════ */
 BOOL WINAPI Hook_ReadFile(
     HANDLE hFile, LPVOID lpBuf, DWORD nBytes,
@@ -1553,9 +1671,13 @@ BOOL WINAPI Hook_ReadFile(
 }
 
 /* ══════════════════════════════════════════════════════════════
- * Hook_ExitWindowsEx — intercept FLS30's shutdown call
- * FLS30.c line 13537: ExitWindowsEx(5, 0)  (EWX_SHUTDOWN|EWX_FORCE)
- * Replace with ExitProcess(0) so the PC does not actually shut down.
+ * Hook_ExitWindowsEx
+ * ─────────────────────────────────────────────────────────────
+ * The application calls ExitWindowsEx with EWX_SHUTDOWN|EWX_FORCE
+ * when closing.  On a field laptop this would shut down Windows
+ * entirely, which is not what the operator expects.
+ * We intercept it and call ExitProcess(0) instead, so DAULink.exe
+ * exits cleanly without touching the rest of the system.
  * ══════════════════════════════════════════════════════════════ */
 BOOL WINAPI Hook_ExitWindowsEx(UINT uFlags, DWORD dwReason)
 {
@@ -1567,6 +1689,16 @@ BOOL WINAPI Hook_ExitWindowsEx(UINT uFlags, DWORD dwReason)
 
 /* ══════════════════════════════════════════════════════════════
  * SCM hooks — fake the "Packet" service
+ * ─────────────────────────────────────────────────────────────
+ * DAULink.exe calls OpenServiceW("Packet") and StartServiceW at
+ * startup to load the legacy kernel driver.  Since that driver
+ * does not exist on Windows 11 the SCM call would fail, producing
+ * an error dialog before DAULink.exe even gets to the network.
+ *
+ * We intercept OpenServiceW for the "Packet" service name and
+ * return a fake SC_HANDLE.  StartServiceW, QueryServiceStatus,
+ * and CloseServiceHandle on that fake handle all silently succeed.
+ * DAULink.exe moves on believing the driver started fine.
  * ══════════════════════════════════════════════════════════════ */
 SC_HANDLE WINAPI Hook_OpenServiceW(SC_HANDLE hSCM, LPCWSTR name, DWORD acc)
 {

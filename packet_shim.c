@@ -67,19 +67,21 @@ typedef struct pcap_if {
 typedef int  (*PfnPcapFindAllDevs)(pcap_if_t**, char*);
 typedef void (*PfnPcapFreeAllDevs)(pcap_if_t*);
 typedef void (*PfnPcapBreakloop)(pcap_t*);   /* interrupts pcap_next_ex safely */
+typedef int  (*PfnPcapSetMinToCopy)(pcap_t*, int); /* min bytes before waking read */
 
-static HMODULE           g_hWpcap           = NULL;
-static PfnPcapOpenLive   g_pcapOpenLive     = NULL;
-static PfnPcapSendPacket g_pcapSendPkt      = NULL;
-static PfnPcapNextEx     g_pcapNextEx       = NULL;
-static PfnPcapClose      g_pcapClose        = NULL;
-static PfnPcapGeterr     g_pcapGeterr       = NULL;
-static PfnPcapCompile    g_pcapCompile      = NULL;
-static PfnPcapSetFilter  g_pcapSetFilter    = NULL;
-static PfnPcapFreeCode   g_pcapFreeCode     = NULL;
-static PfnPcapFindAllDevs g_pcapFindAllDevs = NULL;
-static PfnPcapFreeAllDevs g_pcapFreeAllDevs = NULL;
-static PfnPcapBreakloop   g_pcapBreakloop   = NULL;
+static HMODULE           g_hWpcap            = NULL;
+static PfnPcapOpenLive   g_pcapOpenLive      = NULL;
+static PfnPcapSendPacket g_pcapSendPkt       = NULL;
+static PfnPcapNextEx     g_pcapNextEx        = NULL;
+static PfnPcapClose      g_pcapClose         = NULL;
+static PfnPcapGeterr     g_pcapGeterr        = NULL;
+static PfnPcapCompile    g_pcapCompile       = NULL;
+static PfnPcapSetFilter  g_pcapSetFilter     = NULL;
+static PfnPcapFreeCode   g_pcapFreeCode      = NULL;
+static PfnPcapFindAllDevs g_pcapFindAllDevs  = NULL;
+static PfnPcapFreeAllDevs g_pcapFreeAllDevs  = NULL;
+static PfnPcapBreakloop   g_pcapBreakloop    = NULL;
+static PfnPcapSetMinToCopy g_pcapSetMinToCopy = NULL;
 
 static HINSTANCE         g_hDll             = NULL; /* set in DllMain */
 
@@ -137,6 +139,33 @@ typedef struct {
      * Only ever touched by this adapter's own RecvThread — no locking needed */
     DWORD        windowMinSeq;  /* lowest  seq# seen in current window  */
     DWORD        windowMaxSeq;  /* highest seq# seen in current window  */
+
+    /* Retransmit injection
+     * When FLS30 sends a large NEXT-WIN retransmit request, the DAU sometimes
+     * skips the confirming FILE-ACK for the retransmit window and jumps
+     * directly to FILE-ACK for window+1, leaving FLS30 waiting forever.
+     * The shim detects this and injects a synthetic FILE-ACK for the
+     * retransmit window so FLS30 can declare it complete.
+     *
+     * retxPending/retxWindow written by Hook_WriteFile, read by RecvThread.
+     * On x86/x64 strong-ordering: write retxWindow before retxPending=TRUE. */
+    volatile LONG retxPending;  /* 1 after RETRANSMIT NEXT-WIN TX, 0 after DAU confirms */
+    volatile WORD retxWindow;   /* window number whose retransmit is in flight          */
+
+    /* Deferred frame: the real FILE-ACK held back while the synthetic is
+     * delivered first.  Delivered to the next IRP after the synthetic. */
+    BOOL  deferredPending;
+    BYTE  deferredFrame[1514];
+    DWORD deferredFrameLen;
+
+    /* Live-view NEXT-WIN auto-forwarding.
+     * The DAU sends live telemetry in bursts of ~64 frames then waits for
+     * a NEXT-WIN before the next burst.  FLS30's Delphi timer takes 1–7 s
+     * to fire the NEXT-WIN.  When set, RecvThread waits at most
+     * LIVE_NEXTWIN_TIMEOUT_MS for FLS30 to send its own NEXT-WIN before
+     * sending one on FLS30's behalf. */
+    volatile BOOL liveDataPendingNextWin;
+    BYTE          dauMac[6];   /* DAU source MAC learned from first RX frame */
 } AdpEntry;
 
 static AdpEntry g_Adp[MAX_ADP];
@@ -156,6 +185,27 @@ static BOOL  g_ReplyReady                 = FALSE;
 /* Fake DAU source MAC used in TestMode injected frames */
 static const BYTE k_FakeDauMac[6]         = {0x00,0xDE,0xAD,0xDA,0x7F,0x00};
 
+/* ── Log-file state ───────────────────────────────────────────────
+ * All log output goes to a timestamped file in C:\FLS_DOWNLOAD\
+ * using synchronous WriteFile (fast: write-back cache, no kernel
+ * mutex unlike OutputDebugStringW).
+ * High-frequency per-chunk events (FILE-CHUNK, ReadFile queued)
+ * are suppressed to keep the file small and eliminate DebugView
+ * overhead that was causing disk-thread backup in FLS30.
+ * Control-plane events (FILE-ACK, NEXT-WIN, retransmit, errors)
+ * are written to both the file and OutputDebugStringW so that
+ * DebugView still works for real-time monitoring.
+ */
+static HANDLE          g_LogFile          = INVALID_HANDLE_VALUE;
+static CRITICAL_SECTION g_LogCS;
+static LARGE_INTEGER   g_LogStartQPC      = {{0,0}};
+static LARGE_INTEGER   g_LogQPCFreq       = {{0,0}};
+/* Master logging switch — set from INI [Debug] Logging=0/1 (default 1).
+ * When FALSE both Log() and LogFile() return immediately, the log file
+ * is closed after the "logging disabled" banner, and OutputDebugStringW
+ * is never called.  Zero performance impact during transfers. */
+static BOOL            g_LogEnabled       = TRUE;
+
 
 /* ── Forward declarations ─────────────────────────────────────── */
 static BOOL      ShimInit(void);
@@ -173,14 +223,124 @@ static void      Log(LPCWSTR fmt, ...);
 /* ══════════════════════════════════════════════════════════════
  * Logging
  * ══════════════════════════════════════════════════════════════ */
-static void Log(LPCWSTR fmt, ...)
+
+/* Open a timestamped log file in C:\FLS_DOWNLOAD\.
+ * Called from DllMain before ShimInit so all startup messages land
+ * in the file.  Falls back silently if the directory cannot be
+ * created (g_LogFile stays INVALID_HANDLE_VALUE → file path skipped). */
+static void LogInit(void)
 {
-    WCHAR buf[512];
+    InitializeCriticalSection(&g_LogCS);
+    QueryPerformanceFrequency(&g_LogQPCFreq);
+    QueryPerformanceCounter(&g_LogStartQPC);
+
+    /* Create the log directory if it doesn't exist yet */
+    LPCWSTR logDir = L"C:\\FLS_DOWNLOAD";
+    CreateDirectoryW(logDir, NULL); /* silently ignores ERROR_ALREADY_EXISTS */
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    WCHAR logPath[MAX_PATH];
+    StringCchPrintfW(logPath, MAX_PATH,
+        L"%s\\shim_%04u%02u%02u-%02u%02u%02u.log",
+        logDir,
+        (DWORD)st.wYear, (DWORD)st.wMonth, (DWORD)st.wDay,
+        (DWORD)st.wHour, (DWORD)st.wMinute, (DWORD)st.wSecond);
+
+    g_LogFile = CreateFileW(logPath,
+        GENERIC_WRITE, FILE_SHARE_READ,
+        NULL, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+        NULL);
+    /* If creation fails just continue — OutputDebugStringW still works */
+}
+
+static void LogClose(void)
+{
+    if (g_LogFile != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_LogFile);
+        g_LogFile = INVALID_HANDLE_VALUE;
+    }
+    DeleteCriticalSection(&g_LogCS);
+}
+
+/* Write a formatted, timestamped line to the log file only.
+ * Never calls OutputDebugStringW — zero DebugView overhead.
+ * Used for per-window routine events (FILE-ACK, window boundary,
+ * TX NEXT-WIN, RX hex dumps) that are useful for post-analysis
+ * but do not need real-time visibility. */
+static void LogFile(LPCWSTR fmt, ...)
+{
+    if (!g_LogEnabled) return;
+    if (g_LogFile == INVALID_HANDLE_VALUE) return;
+
+    WCHAR msg[512];
     va_list a;
     va_start(a, fmt);
-    StringCchVPrintfW(buf, 512, fmt, a);
+    StringCchVPrintfW(msg, 512, fmt, a);
     va_end(a);
-    OutputDebugStringW(buf);
+
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    double secs = (g_LogQPCFreq.QuadPart > 0)
+        ? (double)(now.QuadPart - g_LogStartQPC.QuadPart)
+          / (double)g_LogQPCFreq.QuadPart
+        : 0.0;
+
+    WCHAR line[600];
+    StringCchPrintfW(line, 600, L"[%10.6f] %s", secs, msg);
+
+    char utf8[1200];
+    int n = WideCharToMultiByte(CP_UTF8, 0, line, -1,
+                                utf8, (int)sizeof(utf8) - 1,
+                                NULL, NULL);
+    if (n > 1) {
+        DWORD written;
+        EnterCriticalSection(&g_LogCS);
+        WriteFile(g_LogFile, utf8, (DWORD)(n - 1), &written, NULL);
+        LeaveCriticalSection(&g_LogCS);
+    }
+}
+
+/* Write to BOTH the log file and OutputDebugStringW.
+ * Reserved for rare/important events: startup, errors, retransmit
+ * detection, ABORT.  These fire at most a few hundred times per
+ * session so the DBWinMutex overhead is negligible. */
+static void Log(LPCWSTR fmt, ...)
+{
+    if (!g_LogEnabled) return;
+    WCHAR msg[512];
+    va_list a;
+    va_start(a, fmt);
+    StringCchVPrintfW(msg, 512, fmt, a);
+    va_end(a);
+
+    /* Real-time visibility in DebugView / WinDbg */
+    OutputDebugStringW(msg);
+
+    /* Also record in the file with timestamp */
+    if (g_LogFile != INVALID_HANDLE_VALUE) {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        double secs = (g_LogQPCFreq.QuadPart > 0)
+            ? (double)(now.QuadPart - g_LogStartQPC.QuadPart)
+              / (double)g_LogQPCFreq.QuadPart
+            : 0.0;
+
+        WCHAR line[600];
+        StringCchPrintfW(line, 600, L"[%10.6f] %s", secs, msg);
+
+        char utf8[1200];
+        int n = WideCharToMultiByte(CP_UTF8, 0, line, -1,
+                                    utf8, (int)sizeof(utf8) - 1,
+                                    NULL, NULL);
+        if (n > 1) {
+            DWORD written;
+            EnterCriticalSection(&g_LogCS);
+            WriteFile(g_LogFile, utf8, (DWORD)(n - 1), &written, NULL);
+            LeaveCriticalSection(&g_LogCS);
+        }
+    }
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -192,6 +352,7 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved)
     if (reason == DLL_PROCESS_ATTACH) {
         g_hDll = hInst;
         DisableThreadLibraryCalls(hInst);
+        LogInit(); /* open log file first so ShimInit messages land in it */
         InitializeCriticalSection(&g_Lock);
         InitializeCriticalSection(&g_ReplyLock);
         ShimInit();
@@ -212,6 +373,7 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved)
         if (g_hWpcap) FreeLibrary(g_hWpcap);
         DeleteCriticalSection(&g_Lock);
         DeleteCriticalSection(&g_ReplyLock);
+        LogClose(); /* flush and close log file last */
     }
     return TRUE;
 }
@@ -237,7 +399,8 @@ static BOOL ShimInit(void)
         g_pcapFreeCode   = (PfnPcapFreeCode)  GetProcAddress(g_hWpcap, "pcap_freecode");
         g_pcapFindAllDevs= (PfnPcapFindAllDevs)GetProcAddress(g_hWpcap, "pcap_findalldevs");
         g_pcapFreeAllDevs= (PfnPcapFreeAllDevs)GetProcAddress(g_hWpcap, "pcap_freealldevs");
-        g_pcapBreakloop  = (PfnPcapBreakloop)  GetProcAddress(g_hWpcap, "pcap_breakloop");
+        g_pcapBreakloop   = (PfnPcapBreakloop)   GetProcAddress(g_hWpcap, "pcap_breakloop");
+        g_pcapSetMinToCopy= (PfnPcapSetMinToCopy)GetProcAddress(g_hWpcap, "pcap_setmintocopy");
         Log(L"[PacketShim] wpcap.dll loaded OK\n");
     } else {
         Log(L"[PacketShim] WARNING: wpcap.dll not found\n");
@@ -268,6 +431,20 @@ static BOOL ShimInit(void)
                              g_AdapterName, 128, iniPath);
     g_TestMode = (GetPrivateProfileIntW(L"Debug", L"TestMode", 0, iniPath) != 0);
     if (g_TestMode) Log(L"[PacketShim] *** TEST MODE ENABLED — synthetic DAU frames ***\n");
+
+    /* Logging master switch: [Debug] Logging=1 (default on).
+     * Set to 0 in the INI to suppress all output — no file writes,
+     * no OutputDebugStringW, zero overhead during transfers. */
+    BOOL loggingOn = (GetPrivateProfileIntW(L"Debug", L"Logging", 1, iniPath) != 0);
+    if (!loggingOn) {
+        /* Write one final banner while logging is still enabled, then
+         * flip the switch and close the file — zero overhead from here on. */
+        Log(L"[PacketShim] Logging DISABLED via INI — no further output.\n");
+        g_LogEnabled = FALSE;
+        LogClose(); /* close file; g_LogFile → INVALID_HANDLE_VALUE */
+    } else {
+        Log(L"[PacketShim] Logging ENABLED\n");
+    }
     FetchMac();
 
     g_Initialised = TRUE;
@@ -602,6 +779,16 @@ static HANDLE OpenPcapHandle(DWORD acc, DWORD share, DWORD flags)
         }
     }
 
+    /* Force Npcap to deliver every packet immediately.
+     * Default min-copy is ~16 KB, meaning the kernel may hold frames
+     * until the buffer fills before waking pcap_next_ex.  Setting it to
+     * 1 byte delivers each frame the moment it arrives, cutting per-frame
+     * latency from tens of milliseconds down to near zero. */
+    if (g_pcapSetMinToCopy) {
+        int mc = g_pcapSetMinToCopy(pcap, 1);
+        Log(L"[PacketShim] pcap_setmintocopy(1) = %d\n", mc);
+    }
+
     EnterCriticalSection(&g_Lock);
     for (int i = 0; i < MAX_ADP; i++) {
         if (g_Adp[i].inUse) continue;
@@ -663,6 +850,30 @@ static void BuildSynthFrame(BYTE *out60, const BYTE *dst, const BYTE *src,
     out60[12] = 0xAA; out60[13] = 0x55;
     if (payLen > 46) payLen = 46;
     CopyMemory(out60 + 14, payload, payLen);
+}
+
+/* ── Live-view NEXT-WIN auto-forwarding ───────────────────────────────────
+ * How long RecvThread waits for FLS30 to send its own NEXT-WIN after a
+ * LIVE-DATA burst ends before the shim sends one on FLS30's behalf.
+ * 50 ms is fast enough to achieve ~1.6 Hz refresh (vs 1–7 s without this)
+ * while still giving FLS30 a brief window to respond naturally. */
+#define LIVE_NEXTWIN_TIMEOUT_MS  50
+
+static void SendLiveNextWin(AdpEntry *a)
+{
+    /* Build the same NEXT-WIN frame FLS30 would send:
+     * dst=DAU MAC, src=our MAC, EtherType=AA55, type=02 04, rest=zeros. */
+    BYTE frame[60];
+    ZeroMemory(frame, sizeof(frame));
+    CopyMemory(frame + 0, a->dauMac,  6);   /* dst = DAU */
+    CopyMemory(frame + 6, g_Mac,      6);   /* src = us  */
+    frame[12] = 0xAA; frame[13] = 0x55;    /* EtherType  */
+    frame[14] = 0x02; frame[15] = 0x04;    /* NEXT-WIN   */
+    /* bytes [16..59] already zero = window 0, missingCnt 0 (COMPLETE) */
+    if (g_pcapSendPkt && a->pcap) {
+        int r = g_pcapSendPkt(a->pcap, frame, sizeof(frame));
+        LogFile(L"[PacketShim] LiveView: auto-sent NEXT-WIN to DAU (r=%d)\n", r);
+    }
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -735,9 +946,22 @@ static DWORD WINAPI RecvThread(LPVOID param)
 
     /* ── NORMAL MODE (real pcap) ──────────────────────────────── */
     while (!a->stopThread) {
-        /* Wait for Hook_ReadFile to post a pending IRP */
-        if (WaitForSingleObject(a->startEvt, 200) != WAIT_OBJECT_0)
+        /* Wait for Hook_ReadFile to post a pending IRP.
+         * If a LIVE-DATA burst just ended (liveDataPendingNextWin), use a
+         * short timeout so the shim can auto-send NEXT-WIN if FLS30 is slow. */
+        DWORD waitMs = a->liveDataPendingNextWin
+                       ? LIVE_NEXTWIN_TIMEOUT_MS
+                       : 200;
+        DWORD wr = WaitForSingleObject(a->startEvt, waitMs);
+        if (wr == WAIT_TIMEOUT) {
+            if (a->liveDataPendingNextWin) {
+                /* FLS30 hasn't responded within the timeout window — send
+                 * NEXT-WIN on FLS30's behalf to keep the DAU streaming. */
+                a->liveDataPendingNextWin = FALSE;
+                SendLiveNextWin(a);
+            }
             continue;
+        }
         if (a->stopThread) break;
 
         /* Pop one IRP from the queue */
@@ -751,6 +975,22 @@ static DWORD WINAPI RecvThread(LPVOID param)
         BOOL moreIrps = (a->irpHead != a->irpTail);
         LeaveCriticalSection(&a->irpLock);
         if (moreIrps) SetEvent(a->startEvt); /* re-signal for remaining IRPs */
+
+        /* ── Deliver deferred FILE-ACK ───────────────────────────────────────
+         * When a FILE-ACK for W+N arrived while retxPending was set for W,
+         * RecvThread stashed it here and kept waiting for the real FILE-ACK W.
+         * Once FILE-ACK W was delivered (clearing retxPending), the next IRP
+         * lands here and we deliver the deferred W+N frame so FLS30 can
+         * advance normally. */
+        if (a->deferredPending) {
+            a->deferredPending = FALSE;
+            WORD defWin = (WORD)a->deferredFrame[22] | ((WORD)a->deferredFrame[23] << 8);
+            WORD defCnt = (WORD)a->deferredFrame[24] | ((WORD)a->deferredFrame[25] << 8);
+            LogFile(L"[PacketShim] Delivering deferred FILE-ACK: window=0x%04X count=%u\n",
+                (DWORD)defWin, (DWORD)defCnt);
+            DeliverFrame(&req, a->deferredFrame, a->deferredFrameLen);
+            continue; /* IRP consumed; go wait for the next one */
+        }
 
         /* Drain pcap until one frame arrives or we are stopped */
         while (!a->stopThread) {
@@ -807,102 +1047,140 @@ static DWORD WINAPI RecvThread(LPVOID param)
                         a->windowMaxSeq = seq;
                 }
 
-                /* ── Option-A fix: patch FILE-ACK window-count field ───────
-                 *
-                 * FLS30's case-0xe handler calls FUN_004379b8(obj, uStack_1ae)
-                 * where uStack_1ae is read from the 02 02 frame at byte offset
-                 * FILE_ACK_WINCOUNT_OFFSET (little-endian WORD).
-                 *
-                 * If the DAU's 02 02 is a minimum-padded 60-byte frame, that
-                 * field is zero.  FUN_004379b8(x, 0) skips its bitmap loop and
-                 * returns "complete", so FLS30 never sends NEXT-WIN → stall.
-                 *
-                 * Fix: compute ExpectedCount = (max_seq - min_seq + 1) from
-                 * the observed chunk sequence numbers, which correctly handles
-                 * mid-burst drops (a missing seq still shows as a gap in the
-                 * bitmap).  Only a dropped last chunk is still under-counted,
-                 * which is an inherent limitation without the DAU's count.
-                 *
-                 * Byte layout of the 02 02 frame (offsets from frame start):
+                /* ── FILE-ACK frame layout (confirmed from log analysis) ─────
                  *   [14..15] = 02 02 (type)
-                 *   [16..17] = window seq number  (uStack_1b0, USHORT)
-                 *   [18..19] = secondary field     (uStack_1b2, USHORT)
-                 *   [20..21] = window chunk count  (uStack_1ae, USHORT) ← PATCH
-                 *   [22..59] = zero padding
-                 */
-#define FILE_ACK_WINCOUNT_OFFSET  20   /* byte index in Ethernet frame */
-
-                /* Delivery pointer — normally the raw pcap frame.
-                 * For the FILE-ACK patch we switch to a local mutable copy. */
-                BYTE        patchBuf[1518];
-                const BYTE *deliverPkt = pkt;
-                DWORD        deliverLen = hdr->caplen;
+                 *   [16..17] = running seq count (LE WORD)
+                 *   [18..19] = secondary field
+                 *   [20..21] = protocol constant (always 0x0003; NOT chunk count)
+                 *   [22..23] = window number (LE WORD)
+                 *   [24..25] = chunk count for this window (LE WORD)
+                 *   [26..]   = sensor/status payload
+                 *
+                 * When the DAU skips the confirming FILE-ACK for a retransmit
+                 * window, the shim injects a synthetic one (count=0 so FLS30
+                 * calls FUN_004379b8(obj,0) → instant "complete") and defers
+                 * the real next-window FILE-ACK to the following IRP delivery.
+                 * ──────────────────────────────────────────────────────────── */
 
                 if (rxT0==0x02 && rxT1==0x02) {
-                    /* Snapshot and reset — no atomics needed (single thread) */
+                    /* Snapshot and reset seq tracking — single thread, no lock */
                     DWORD minSeq = a->windowMinSeq;
                     DWORD maxSeq = a->windowMaxSeq;
                     a->windowMinSeq = INVALID_SEQ;
                     a->windowMaxSeq = 0;
 
+                    /* Log seq range if available */
                     if (minSeq != INVALID_SEQ && maxSeq >= minSeq) {
                         DWORD expectedCount = (maxSeq - minSeq) + 1;
-                        Log(L"[PacketShim] *** Window boundary: seq %lu..%lu → expected %lu chunks ***\n",
+                        LogFile(L"[PacketShim] *** Window boundary: seq %lu..%lu → expected %lu chunks ***\n",
                             minSeq, maxSeq, expectedCount);
+                    }
 
-                        if (hdr->caplen >= FILE_ACK_WINCOUNT_OFFSET + 2) {
-                            WORD existing =
-                                (WORD)(pkt[FILE_ACK_WINCOUNT_OFFSET]) |
-                                ((WORD)(pkt[FILE_ACK_WINCOUNT_OFFSET + 1]) << 8);
+                    /* Read window number [22..23] and chunk count [24..25] */
+                    if (hdr->caplen >= 26) {
+                        WORD ackWin   = (WORD)pkt[22] | ((WORD)pkt[23] << 8);
+                        WORD ackCount = (WORD)pkt[24] | ((WORD)pkt[25] << 8);
+                        LogFile(L"[PacketShim] FILE-ACK: window=0x%04X count=%u\n",
+                            (DWORD)ackWin, (DWORD)ackCount);
 
-                            if (existing == 0) {
-                                /* Overflow guard: only copy if the frame fits */
-                                if (hdr->caplen > sizeof(patchBuf)) {
-                                    Log(L"[PacketShim] FILE-ACK frame too large (%u bytes) for patchBuf, skipping patch\n",
-                                        hdr->caplen);
-                                } else {
-                                    /* Zero-padded count field — patch with seq-derived count */
-                                    WORD cnt = (expectedCount > 0xFFFF) ? 0xFFFF : (WORD)expectedCount;
-                                    CopyMemory(patchBuf, pkt, hdr->caplen);
-                                    patchBuf[FILE_ACK_WINCOUNT_OFFSET]     = (BYTE)(cnt & 0xFF);
-                                    patchBuf[FILE_ACK_WINCOUNT_OFFSET + 1] = (BYTE)(cnt >> 8);
-                                    deliverPkt = patchBuf;
-                                    Log(L"[PacketShim] *** FILE-ACK PATCHED: offset[%d..%d] 0x0000 → 0x%04X (%lu chunks) ***\n",
-                                        FILE_ACK_WINCOUNT_OFFSET, FILE_ACK_WINCOUNT_OFFSET + 1,
-                                        (DWORD)cnt, expectedCount);
-                                }
-                            } else {
-                                Log(L"[PacketShim] FILE-ACK offset[%d..%d] = 0x%04X (non-zero, not patched)\n",
-                                    FILE_ACK_WINCOUNT_OFFSET, FILE_ACK_WINCOUNT_OFFSET + 1,
-                                    (DWORD)existing);
-                            }
+                        /* ── Retransmit window tracking ──────────────────────
+                         * retxPending is set when FLS30 sends a RETRANSMIT
+                         * NEXT-WIN for window W (Hook_WriteFile).  We wait for
+                         * the DAU to send the confirming FILE-ACK W directly
+                         * before delivering it to FLS30.
+                         *
+                         * If the DAU skips W and sends FILE-ACK W+N first, we
+                         * stash W+N as deferred and keep waiting.  We must NOT
+                         * synthesise a fake FILE-ACK W: FLS30's ring buffer for
+                         * W may still be partially filled (retransmit in
+                         * progress), so running FUN_004379b8 on it early causes
+                         * FLS30 to go completely silent (no RETRANSMIT, no
+                         * COMPLETE) and eventually ABORT.
+                         * ──────────────────────────────────────────────────── */
+                        if (a->retxPending && ackWin > a->retxWindow) {
+                            /* FILE-ACK for W+N arrived while still waiting for
+                             * the DAU to confirm window W's retransmit via a
+                             * direct FILE-ACK W.
+                             *
+                             * Do NOT synthesise anything — FLS30's ring buffer
+                             * for W is still being filled by the retransmit and
+                             * any synthetic FILE-ACK W would cause FUN_004379b8
+                             * to run on an incomplete ring, leaving FLS30 silent.
+                             *
+                             * Instead: stash W+N as deferred, keep retxPending=1,
+                             * and continue the pcap loop.  When the DAU eventually
+                             * sends the real FILE-ACK W (ackWin==retxWindow path
+                             * below), we clear retxPending, deliver FILE-ACK W to
+                             * FLS30, and the deferred W+N frame is picked up by
+                             * the IRP-loop at the top of RecvThread on the next
+                             * iteration. */
+                            DWORD copyLen = hdr->caplen < sizeof(a->deferredFrame)
+                                            ? hdr->caplen
+                                            : (DWORD)sizeof(a->deferredFrame);
+                            a->deferredFrameLen = copyLen;
+                            CopyMemory(a->deferredFrame, pkt, copyLen);
+                            a->deferredPending = TRUE;
+
+                            Log(L"[PacketShim] RetxWait: FILE-ACK win=0x%04X deferred (retxWindow=0x%04X still pending)\n",
+                                (DWORD)ackWin, (DWORD)(WORD)a->retxWindow);
+
+                            continue; /* keep retxPending=1; wait for FILE-ACK W */
+
+                        } else if (a->retxPending && ackWin == a->retxWindow) {
+                            /* DAU sent the confirming FILE-ACK for the exact
+                             * retransmit window — no injection needed. */
+                            InterlockedExchange(&a->retxPending, 0);
+                            LogFile(L"[PacketShim] RetxPending cleared: legitimate FILE-ACK for win=0x%04X\n",
+                                (DWORD)ackWin);
                         }
                     } else {
-                        Log(L"[PacketShim] FILE-ACK: no chunks this window (minSeq=INVALID), skipping patch\n");
+                        Log(L"[PacketShim] FILE-ACK too short (%u bytes)\n", hdr->caplen);
                     }
                 }
 
-                /* ── Build hex dump (from deliverPkt so patched bytes show) ── */
-                BOOL fullDump = (rxT0==0x02 && rxT1==0x02) ||  /* FILE-ACK  */
-                                (rxT0==0x01 && rxT1==0x0C);    /* DAU-POLL  */
-                DWORD logLen = fullDump ? deliverLen :
-                               (deliverLen < 20 ? deliverLen : 20);
-                /* 3 chars/byte + NUL; 60 bytes max → 181 chars */
-                WCHAR hexBuf[200] = {0};
-                WCHAR *wp = hexBuf;
-                for (DWORD bi = 0; bi < logLen; bi++) {
-                    StringCchPrintfW(wp, 6, L"%02X ", deliverPkt[bi]);
-                    wp += 3;
+                /* ── RX frame log (skip FILE-CHUNK to prevent DebugView storm) ──
+                 * FILE-CHUNK (02 01) frames arrive at wire rate (~100/window).
+                 * Logging every one fills DebugView and causes ~80 ms/chunk
+                 * overhead that starves FLS30's disk thread.  The window
+                 * boundary message already summarises the chunk count and seq
+                 * range, so individual chunk logs add no diagnostic value.
+                 * All other frame types (FILE-ACK, DAU-POLL, NEXT-WIN, etc.)
+                 * are logged with a full or partial hex dump as before. */
+                if (!(rxT0==0x02 && rxT1==0x01)) {
+                    BOOL fullDump = (rxT0==0x02 && rxT1==0x02) ||  /* FILE-ACK  */
+                                    (rxT0==0x01 && rxT1==0x0C);    /* DAU-POLL  */
+                    DWORD logLen = fullDump ? hdr->caplen :
+                                   (hdr->caplen < 20 ? hdr->caplen : 20);
+                    /* 3 chars/byte + NUL; 60 bytes max → 181 chars */
+                    WCHAR hexBuf[200] = {0};
+                    WCHAR *wp = hexBuf;
+                    for (DWORD bi = 0; bi < logLen; bi++) {
+                        StringCchPrintfW(wp, 6, L"%02X ", pkt[bi]);
+                        wp += 3;
+                    }
+                    if (req.bufSz > 0 && hdr->caplen > req.bufSz) {
+                        LogFile(L"[PacketShim] RX %u bytes [%s] TRUNCATED to buf=%u  %s\n",
+                            hdr->caplen, ftype, req.bufSz, hexBuf);
+                    } else {
+                        LogFile(L"[PacketShim] RX %u bytes [%s] buf=%u  %s\n",
+                            hdr->caplen, ftype, req.bufSz, hexBuf);
+                    }
+                }
+                /* ── DAU MAC learning & live-view NEXT-WIN trigger ───────
+                 * Learn the DAU's source MAC from the first received frame.
+                 * When a LIVE-DATA (03 03) frame is delivered, set the
+                 * pending flag so RecvThread auto-sends NEXT-WIN if FLS30's
+                 * Delphi timer doesn't fire within LIVE_NEXTWIN_TIMEOUT_MS. */
+                if (hdr->caplen >= 12 &&
+                    (a->dauMac[0] | a->dauMac[1] | a->dauMac[2] |
+                     a->dauMac[3] | a->dauMac[4] | a->dauMac[5]) == 0) {
+                    CopyMemory(a->dauMac, pkt + 6, 6);
+                }
+                if (rxT0 == 0x03 && rxT1 == 0x03) {
+                    a->liveDataPendingNextWin = TRUE;
                 }
 
-                if (req.bufSz > 0 && hdr->caplen > req.bufSz) {
-                    Log(L"[PacketShim] RX %u bytes [%s] TRUNCATED to buf=%u  %s\n",
-                        hdr->caplen, ftype, req.bufSz, hexBuf);
-                } else {
-                    Log(L"[PacketShim] RX %u bytes [%s] buf=%u  %s\n",
-                        hdr->caplen, ftype, req.bufSz, hexBuf);
-                }
-                DeliverFrame(&req, deliverPkt, deliverLen);
+                DeliverFrame(&req, pkt, hdr->caplen);
                 break;
             } else if (r == 0) {
                 continue;   /* 1 ms timeout — retry */
@@ -1148,7 +1426,58 @@ BOOL WINAPI Hook_WriteFile(
                 StringCchPrintfW(wp2, 6, L"%02X ", fp[bi]);
                 wp2 += 3;
             }
-            Log(L"[PacketShim] TX %u bytes [%s]  %s\n", nBytes, txtype, txHex);
+            /* ABORT always goes to DebugView; everything else is file-only */
+            if (t0==0x02 && t1==0x05)
+                Log(L"[PacketShim] TX %u bytes [%s]  %s\n", nBytes, txtype, txHex);
+            else
+                LogFile(L"[PacketShim] TX %u bytes [%s]  %s\n", nBytes, txtype, txHex);
+
+            /* ── NEXT-WIN (02 04) processing ──────────────────────────────────
+             * Two sub-cases:
+             *   missingCnt > 0 → RETRANSMIT: track the window, set retxPending.
+             *   missingCnt == 0 → COMPLETE:   may be spurious (FLS30 bug — the
+             *     second vmethod in case-0xe's RETRANSMIT branch fires a COMPLETE
+             *     NEXT-WIN for the previous window immediately after sending the
+             *     RETRANSMIT NEXT-WIN for the current window).  If retxPending is
+             *     set and this COMPLETE is for a window earlier than retxWindow,
+             *     DROP it — the DAU must not see it or it will skip the retransmit
+             *     of retxWindow and advance, causing FLS30's guard (0xed8) to
+             *     permanently fail for all subsequent windows.
+             * ─────────────────────────────────────────────────────────────────── */
+            if (t0==0x02 && t1==0x04 && nBytes >= 26) {
+                const BYTE *fp2 = (const BYTE*)lpBuf;
+                WORD winNum     = (WORD)fp2[22] | ((WORD)fp2[23] << 8);
+                WORD missingCnt = (WORD)fp2[24] | ((WORD)fp2[25] << 8);
+                if (missingCnt > 0) {
+                    /* RETRANSMIT NEXT-WIN: record it */
+                    a->retxWindow = winNum;
+                    InterlockedExchange(&a->retxPending, 1);
+                    Log(L"[PacketShim] RetxTrack: window=0x%04X missing=%u — awaiting DAU retransmit\n",
+                        (DWORD)a->retxWindow, (DWORD)missingCnt);
+                } else {
+                    /* COMPLETE NEXT-WIN from FLS30 — cancel live-view auto-send
+                     * so RecvThread doesn't double-send for the same cycle. */
+                    if (a->liveDataPendingNextWin) {
+                        a->liveDataPendingNextWin = FALSE;
+                        LogFile(L"[PacketShim] LiveView: FLS30 sent own NEXT-WIN — auto-send cancelled\n");
+                    }
+                }
+                if (a->retxPending && winNum < a->retxWindow) {
+                    /* SPURIOUS COMPLETE for a window < retxWindow — DROP IT.
+                     * This is the second-vmethod ghost frame from FLS30's
+                     * RETRANSMIT branch.  Swallow it silently so the DAU
+                     * honours the preceding RETRANSMIT request. */
+                    Log(L"[PacketShim] *** DROPPING spurious COMPLETE NEXT-WIN win=0x%04X (retxWindow=0x%04X) — not sending to DAU ***\n",
+                        (DWORD)winNum, (DWORD)a->retxWindow);
+                    if (lpWritten) *lpWritten = nBytes;
+                    if (lpOv) {
+                        lpOv->InternalHigh = nBytes;
+                        lpOv->Internal     = 0;
+                        if (lpOv->hEvent) SetEvent(lpOv->hEvent);
+                    }
+                    return TRUE;   /* lie to FLS30: "sent OK" — packet eaten */
+                }
+            }
         }
         int r = g_pcapSendPkt(a->pcap, (const unsigned char*)lpBuf, (int)nBytes);
         if (r == 0) {
@@ -1197,8 +1526,9 @@ BOOL WINAPI Hook_ReadFile(
             lpOv->Internal     = (ULONG_PTR)0x103; /* STATUS_PENDING */
             lpOv->InternalHigh = 0;
             if (lpRead) *lpRead = 0;
-            Log(L"[PacketShim] ReadFile queued: buf=%u bytes (head=%d)\n",
-                nBytes, a->irpHead);
+            /* ReadFile queued — not logged; fires ~100× per window
+             * and would flood DebugView.  Window boundary messages
+             * already capture the IRP flow at the right granularity. */
             SetEvent(a->startEvt);
             SetLastError(ERROR_IO_PENDING);
             return FALSE;

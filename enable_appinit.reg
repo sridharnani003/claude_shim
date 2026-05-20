@@ -1,0 +1,10 @@
+Windows Registry Editor Version 5.00
+
+; Loads packet_shim.dll into FLS30.exe automatically via AppInit_DLLs.
+; No injection tool (fls30_loader.exe) needed — Norton-safe.
+; Double-click this file as Administrator, then launch FLS30.exe directly.
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows]
+"AppInit_DLLs"="C:\\FLS30\\BIN\\packet_shim.dll"
+"LoadAppInit_DLLs"=dword:00000001
+"RequireSignedAppInit_DLLs"=dword:00000000

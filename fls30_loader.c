@@ -135,6 +135,13 @@ static BOOL InjectDll(HANDLE hProcess, LPCWSTR dllPath)
 
     /* Get address of LoadLibraryW in kernel32 (same in all x86 WoW64 procs) */
     HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+    /* VULN-18: GetModuleHandleW can return NULL if kernel32 is somehow not
+     * mapped (should never happen in a real process, but guard anyway to
+     * prevent passing NULL to GetProcAddress, which is undefined behaviour). */
+    if (!hKernel32) {
+        wprintf(L"[!] GetModuleHandleW(kernel32.dll) returned NULL: %u\n", GetLastError());
+        goto cleanup;
+    }
     FARPROC pfnLoadLib = GetProcAddress(hKernel32, "LoadLibraryW");
     if (!pfnLoadLib) {
         wprintf(L"[!] GetProcAddress(LoadLibraryW): %u\n", GetLastError());
@@ -171,7 +178,27 @@ static BOOL InjectDll(HANDLE hProcess, LPCWSTR dllPath)
     }
     wprintf(L"[+] DLL loaded at remote base = 0x%08X\n", exitCode);
 
-    /* Call PacketShimInit in the remote process to install IAT hooks */
+    /* Call PacketShimInit in the remote process to install IAT hooks.
+     *
+     * VULN-03 — ASLR offset assumption:
+     * We load the DLL locally, compute the RVA of PacketShimInit
+     * (pfnInit - hShimLocal), and add that RVA to the remote base address
+     * returned by the LoadLibraryW remote thread (exitCode).
+     *
+     * This is valid because:
+     *   a) Both processes are 32-bit WoW64 — the same DLL image is used.
+     *   b) On the same machine Windows maps the DLL at the same preferred
+     *      base in all processes when ASLR has not relocated it.  If ASLR
+     *      does relocate, both the local and remote loads use the same
+     *      relocated base (ASLR picks one base per boot per image, applied
+     *      identically across processes).
+     *   c) Even with per-process ASLR ("ASLR for DLLs"), the RVA offset
+     *      within the image is fixed — only the base changes, and `exitCode`
+     *      gives us the actual remote base, so `exitCode + RVA` is correct.
+     *
+     * Limitation: this does NOT work across machines or if the DLL on disk
+     * is rebuilt between the local and remote loads (different image).  For
+     * this use case (same machine, same session) it is reliable. */
     HMODULE hShimLocal = LoadLibraryW(dllPath);
     if (hShimLocal) {
         FARPROC pfnInit = GetProcAddress(hShimLocal, "PacketShimInit");

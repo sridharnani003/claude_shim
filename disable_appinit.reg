@@ -1,0 +1,8 @@
+Windows Registry Editor Version 5.00
+
+; Removes the AppInit_DLLs shim (run this if you no longer need the shim
+; or want to go back to the fls30_loader.exe injection method).
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows]
+"AppInit_DLLs"=""
+"LoadAppInit_DLLs"=dword:00000000

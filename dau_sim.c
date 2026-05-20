@@ -109,16 +109,22 @@ int main(void)
     int choice = 0;
     scanf_s("%d", &choice);
 
+    /* VULN-13: reject negative indices — they would wrap the unsigned loop
+     * counter and traverse arbitrary memory past the device list. */
+    if (choice < 0) { printf("Invalid choice\n"); pfFreeAllDevs(devs); return 1; }
+
     const char *devName = NULL;
     idx = 0;
     for (pcap_if_t *d = devs; d; d = d->next, idx++) {
         if (idx == choice) { devName = d->name; break; }
     }
-    if (!devName) { printf("Invalid choice\n"); return 1; }
+    if (!devName) { printf("Invalid choice\n"); pfFreeAllDevs(devs); return 1; }
 
     printf("\n Opening: %s\n", devName);
     pcap_t *pcap = pfOpen(devName, 65535, 1, 1, errbuf);
-    if (!devs) pfFreeAllDevs(devs);
+    /* VULN-12: inverted null check — was `if (!devs)` which freed NULL and
+     * leaked the list on the success path.  Correct guard is `if (devs)`. */
+    if (devs) pfFreeAllDevs(devs);
     if (!pcap) { printf("pcap_open_live failed: %s\n", errbuf); return 1; }
     printf(" Opened OK\n");
 

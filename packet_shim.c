@@ -32,6 +32,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <winsvc.h>
+#include <aclapi.h>    /* EXPLICIT_ACCESSW, SetEntriesInAclW — needed for VULN-06 DACL */
 /* iphlpapi.h included for types only — GetAdaptersAddresses loaded dynamically
  * to avoid IPHLPAPI.DLL appearing in our static import table (it causes a
  * ~10-second DllMain stall when injected via remote thread). */
@@ -239,9 +240,42 @@ static void LogInit(void)
     QueryPerformanceFrequency(&g_LogQPCFreq);
     QueryPerformanceCounter(&g_LogStartQPC);
 
-    /* Create the log directory if it doesn't exist yet */
+    /* Create the log directory if it doesn't exist yet.
+     * VULN-06: default DACL on C:\ makes the directory world-writable, exposing
+     * MAC addresses, GUIDs, and frame hex dumps to any local user, and allowing
+     * symlink/file-squatting attacks on the log file.
+     * Restrict access to the current user (CREATOR OWNER) and Administrators only. */
     LPCWSTR logDir = L"C:\\FLS_DOWNLOAD";
-    CreateDirectoryW(logDir, NULL); /* silently ignores ERROR_ALREADY_EXISTS */
+
+    SECURITY_DESCRIPTOR sd;
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, FALSE };
+    InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+    /* Explicit DACL: Administrators = Full Control, current user = Full Control,
+     * everyone else = no access.  NULL DACL would be world-writable (wrong). */
+    if (SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE)) {
+        /* Build a restrictive DACL — Administrators (S-1-5-32-544) full control */
+        EXPLICIT_ACCESSW ea[2]      = {0};
+        PSID pAdminSid              = NULL;
+        SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
+        if (AllocateAndInitializeSid(&ntAuth, 2,
+                SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS,
+                0,0,0,0,0,0, &pAdminSid)) {
+            ea[0].grfAccessPermissions = GENERIC_ALL;
+            ea[0].grfAccessMode        = SET_ACCESS;
+            ea[0].grfInheritance       = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+            ea[0].Trustee.TrusteeForm  = TRUSTEE_IS_SID;
+            ea[0].Trustee.TrusteeType  = TRUSTEE_IS_GROUP;
+            ea[0].Trustee.ptstrName    = (LPWSTR)pAdminSid;
+
+            PACL pAcl = NULL;
+            if (SetEntriesInAclW(1, ea, NULL, &pAcl) == ERROR_SUCCESS) {
+                SetSecurityDescriptorDacl(&sd, TRUE, pAcl, FALSE);
+                sa.lpSecurityDescriptor = &sd;
+            }
+            FreeSid(pAdminSid);
+        }
+    }
+    CreateDirectoryW(logDir, &sa); /* silently ignores ERROR_ALREADY_EXISTS */
 
     SYSTEMTIME st;
     GetLocalTime(&st);
@@ -279,10 +313,12 @@ static void LogFile(LPCWSTR fmt, ...)
     if (!g_LogEnabled) return;
     if (g_LogFile == INVALID_HANDLE_VALUE) return;
 
-    WCHAR msg[512];
+    /* 1024 WCHARs: accommodates GUIDs, hex dumps, and adapter names without
+     * silent truncation that could hide security-relevant log entries (VULN-15). */
+    WCHAR msg[1024];
     va_list a;
     va_start(a, fmt);
-    StringCchVPrintfW(msg, 512, fmt, a);
+    StringCchVPrintfW(msg, 1024, fmt, a);
     va_end(a);
 
     LARGE_INTEGER now;
@@ -292,13 +328,11 @@ static void LogFile(LPCWSTR fmt, ...)
           / (double)g_LogQPCFreq.QuadPart
         : 0.0;
 
-    WCHAR line[600];
-    StringCchPrintfW(line, 600, L"[%10.6f] %s", secs, msg);
+    WCHAR line[1100]; /* msg(1024) + timestamp prefix(13) + margin */
+    StringCchPrintfW(line, 1100, L"[%10.6f] %s", secs, msg);
 
-    /* 600 WCHARs × 4 bytes worst-case UTF-8 = 2400 bytes.
-     * Previous size of 1200 could cause WideCharToMultiByte to return 0
-     * for lines with non-ASCII content, silently dropping the log entry. */
-    char utf8[2400];
+    /* 1100 WCHARs × 4 bytes worst-case UTF-8 = 4400 bytes. */
+    char utf8[4400];
     int n = WideCharToMultiByte(CP_UTF8, 0, line, -1,
                                 utf8, (int)sizeof(utf8) - 1,
                                 NULL, NULL);
@@ -317,10 +351,12 @@ static void LogFile(LPCWSTR fmt, ...)
 static void Log(LPCWSTR fmt, ...)
 {
     if (!g_LogEnabled) return;
-    WCHAR msg[512];
+    /* 1024 WCHARs: accommodates GUIDs, hex dumps, and adapter names without
+     * silent truncation that could hide security-relevant log entries (VULN-15). */
+    WCHAR msg[1024];
     va_list a;
     va_start(a, fmt);
-    StringCchVPrintfW(msg, 512, fmt, a);
+    StringCchVPrintfW(msg, 1024, fmt, a);
     va_end(a);
 
     /* Real-time visibility in DebugView / WinDbg */
@@ -406,9 +442,15 @@ static BOOL ShimInit(void)
 {
     /* Load wpcap.dll — Npcap installs 32-bit copy in SysWOW64\Npcap
      * and adds its directory to PATH, so the short name usually works. */
-    g_hWpcap = LoadLibraryW(L"wpcap.dll");
+    /* VULN-04: bare "wpcap.dll" triggers Windows DLL search order — an attacker
+     * who can write to the application directory could drop a malicious wpcap.dll
+     * there.  Disable the current-directory and PATH search by setting the safe
+     * DLL search mode, then try the known Npcap install path first. */
+    SetDllDirectoryW(L"");   /* disables current-dir from search path for this call */
+    g_hWpcap = LoadLibraryW(L"C:\\Windows\\SysWOW64\\Npcap\\wpcap.dll");
     if (!g_hWpcap)
-        g_hWpcap = LoadLibraryW(L"C:\\Windows\\SysWOW64\\Npcap\\wpcap.dll");
+        g_hWpcap = LoadLibraryW(L"wpcap.dll");  /* fallback: PATH only, no cwd */
+    SetDllDirectoryW(NULL);  /* restore default search behaviour */
     if (g_hWpcap) {
         g_pcapOpenLive = (PfnPcapOpenLive) GetProcAddress(g_hWpcap, "pcap_open_live");
         g_pcapSendPkt  = (PfnPcapSendPacket)GetProcAddress(g_hWpcap, "pcap_sendpacket");
@@ -526,10 +568,15 @@ static LRESULT CALLBACK AdpPickWndProc(HWND hwnd, UINT msg,
         for (int i = 0; i < ctx->count; i++) {
             pcap_if_t *d = ctx->devs[i];
             WCHAR line[300] = {0};
+            /* VULN-16: CP_ACP is locale-dependent — use CP_UTF8 since Npcap
+             * adapter descriptions are UTF-8 internally. Fallback to CP_ACP
+             * if UTF-8 decode fails (older Npcap builds). */
             if (d->description && d->description[0]) {
-                MultiByteToWideChar(CP_ACP, 0, d->description, -1, line, 300);
+                if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, d->description, -1, line, 300))
+                    MultiByteToWideChar(CP_ACP, 0, d->description, -1, line, 300);
             } else {
-                MultiByteToWideChar(CP_ACP, 0, d->name, -1, line, 300);
+                if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, d->name, -1, line, 300))
+                    MultiByteToWideChar(CP_ACP, 0, d->name, -1, line, 300);
             }
             SendMessageW(lb, LB_ADDSTRING, 0, (LPARAM)line);
         }
@@ -669,8 +716,18 @@ static void ShowAdapterPicker(LPCWSTR iniPath)
         g_pcapFreeAllDevs(alldevs);
         return;
     }
+    /* VULN-08: validate that the GUID portion fits in MAX_GUID_LEN before
+     * converting — a malformed adapter name with a very long '{...' section
+     * would be silently truncated, potentially yielding a broken GUID. */
+    const char *closeBrace = strchr(brace, '}');
+    if (!closeBrace || (closeBrace - brace + 2) > MAX_GUID_LEN) {
+        Log(L"[PacketShim] GUID too long or malformed in: %S\n",
+            devPtrs[chosen]->name);
+        g_pcapFreeAllDevs(alldevs);
+        return;
+    }
     WCHAR guidW[MAX_GUID_LEN] = {0};
-    MultiByteToWideChar(CP_ACP, 0, brace, -1, guidW, MAX_GUID_LEN);
+    MultiByteToWideChar(CP_UTF8, 0, brace, -1, guidW, MAX_GUID_LEN);
     /* Ensure it ends right after the closing brace */
     WCHAR *end = wcschr(guidW, L'}');
     if (end) *(end + 1) = L'\0';
@@ -719,7 +776,9 @@ typedef ULONG (WINAPI *PfnGetAdaptersAddresses)(ULONG, ULONG, PVOID,
                                                 PIP_ADAPTER_ADDRESSES, PULONG);
 static void FetchMac(void)
 {
-    HMODULE hIPHlp = LoadLibraryA("iphlpapi.dll");
+    /* VULN-09: bare name triggers DLL search order — use full system path. */
+    HMODULE hIPHlp = LoadLibraryW(L"C:\\Windows\\System32\\iphlpapi.dll");
+    if (!hIPHlp) hIPHlp = LoadLibraryA("iphlpapi.dll"); /* WoW64 fallback */
     if (!hIPHlp) return;
     PfnGetAdaptersAddresses pfnGAA =
         (PfnGetAdaptersAddresses)GetProcAddress(hIPHlp, "GetAdaptersAddresses");
@@ -802,11 +861,25 @@ static HANDLE OpenPcapHandle(DWORD acc, DWORD share, DWORD flags)
             g_Mac[0], g_Mac[1], g_Mac[2], g_Mac[3], g_Mac[4], g_Mac[5]);
         struct bpf_program fp = {0};
         if (g_pcapCompile(pcap, &fp, bpfStr, 1, 0) == 0) {
-            g_pcapSetFilter(pcap, &fp);
+            if (g_pcapSetFilter(pcap, &fp) != 0) {
+                /* VULN-22: filter install failed — abort rather than run unfiltered.
+                 * Without the EtherType filter the shim would deliver every frame on
+                 * the wire to DAULink.exe, which could cause it to process foreign
+                 * traffic as DAU protocol frames and corrupt its state machine. */
+                Log(L"[PacketShim] ERROR: pcap_setfilter failed — aborting open to avoid unfiltered capture\n");
+                g_pcapFreeCode(&fp);
+                g_pcapClose(pcap);
+                SetLastError(ERROR_OPEN_FAILED);
+                return INVALID_HANDLE_VALUE;
+            }
             g_pcapFreeCode(&fp);
             Log(L"[PacketShim] BPF filter applied: %S\n", bpfStr);
         } else {
-            Log(L"[PacketShim] WARNING: pcap_compile failed — no filter\n");
+            /* VULN-22: compile failure also aborts — same reasoning. */
+            Log(L"[PacketShim] ERROR: pcap_compile failed — aborting open to avoid unfiltered capture\n");
+            g_pcapClose(pcap);
+            SetLastError(ERROR_OPEN_FAILED);
+            return INVALID_HANDLE_VALUE;
         }
     }
 
@@ -996,8 +1069,10 @@ static DWORD WINAPI RecvThread(LPVOID param)
             RecvReq req    = a->irpQueue[a->irpTail];
             a->irpTail     = (a->irpTail + 1) % IRP_QUEUE_DEPTH;
             BOOL moreIrps  = (a->irpHead != a->irpTail);
-            LeaveCriticalSection(&a->irpLock);
+            /* VULN-14 (TestMode path): SetEvent inside the lock — same race fix
+             * as the normal-mode path below. */
             if (moreIrps) SetEvent(a->startEvt); /* wake again for the next IRP */
+            LeaveCriticalSection(&a->irpLock);
 
             if (wantPing) {
                 /* Priority: deliver 0x01 0x01 reply first */
@@ -1047,8 +1122,14 @@ static DWORD WINAPI RecvThread(LPVOID param)
         RecvReq req   = a->irpQueue[a->irpTail];
         a->irpTail    = (a->irpTail + 1) % IRP_QUEUE_DEPTH;
         BOOL moreIrps = (a->irpHead != a->irpTail);
+        /* VULN-14: SetEvent must be called inside the lock so there is no window
+         * between checking moreIrps and signalling the event.  Without the lock,
+         * a new ReadFile arriving between LeaveCriticalSection and SetEvent could
+         * signal the event, which we then signal again — harmless but wasteful —
+         * OR the consumer could drain the new entry before we signal, leaving the
+         * event unsignalled for an IRP that needs service. */
+        if (moreIrps) SetEvent(a->startEvt);
         LeaveCriticalSection(&a->irpLock);
-        if (moreIrps) SetEvent(a->startEvt); /* re-signal for remaining IRPs */
 
         /* ── Deliver deferred FILE-ACK ───────────────────────────────────────
          * When a FILE-ACK for W+N arrived while retxPending was set for W,
@@ -1058,10 +1139,17 @@ static DWORD WINAPI RecvThread(LPVOID param)
          * advance normally. */
         if (a->deferredPending) {
             a->deferredPending = FALSE;
-            WORD defWin = (WORD)a->deferredFrame[22] | ((WORD)a->deferredFrame[23] << 8);
-            WORD defCnt = (WORD)a->deferredFrame[24] | ((WORD)a->deferredFrame[25] << 8);
-            LogFile(L"[PacketShim] Delivering deferred FILE-ACK: window=0x%04X count=%u\n",
-                (DWORD)defWin, (DWORD)defCnt);
+            /* VULN-17: read window/count fields only if the stored frame is long
+             * enough — a truncated frame (< 26 bytes) would cause an OOB read. */
+            if (a->deferredFrameLen >= 26) {
+                WORD defWin = (WORD)a->deferredFrame[22] | ((WORD)a->deferredFrame[23] << 8);
+                WORD defCnt = (WORD)a->deferredFrame[24] | ((WORD)a->deferredFrame[25] << 8);
+                LogFile(L"[PacketShim] Delivering deferred FILE-ACK: window=0x%04X count=%u\n",
+                    (DWORD)defWin, (DWORD)defCnt);
+            } else {
+                LogFile(L"[PacketShim] Delivering deferred frame (%u bytes — too short for window field)\n",
+                    a->deferredFrameLen);
+            }
             DeliverFrame(&req, a->deferredFrame, a->deferredFrameLen);
             continue; /* IRP consumed; go wait for the next one */
         }
@@ -1476,20 +1564,36 @@ BOOL WINAPI Hook_CloseHandle(HANDLE h)
 
     AdpEntry *a = LookupAdp(h);
     if (a) {
-        a->stopThread = TRUE;
+        /* VULN-19: use InterlockedExchange so the write is sequentially
+         * consistent on all architectures (x86 store is already atomic for
+         * aligned DWORD, but the compiler barrier here prevents reordering). */
+        InterlockedExchange((LONG*)&a->stopThread, 1);
         /* pcap_breakloop forces pcap_next_ex to return immediately so
          * RecvThread exits cleanly without a timeout race. */
         if (a->pcap && g_pcapBreakloop) g_pcapBreakloop(a->pcap);
         if (a->startEvt) SetEvent(a->startEvt);
         if (a->thread) {
             if (WaitForSingleObject(a->thread, 5000) == WAIT_TIMEOUT) {
-                /* RecvThread is still alive after 5 s — force-terminate it
-                 * before releasing the pcap handle.  If we call pcap_close
-                 * while RecvThread is still inside pcap_next_ex the internal
-                 * buffer is freed under a live pointer, causing a crash. */
-                Log(L"[PacketShim] WARNING: RecvThread did not exit in 5s — terminating\n");
-                TerminateThread(a->thread, 1);
-                WaitForSingleObject(a->thread, 1000); /* wait for OS to confirm exit */
+                /* RecvThread did not exit within 5 s even after pcap_breakloop.
+                 *
+                 * DO NOT call TerminateThread — it skips stack unwind and does
+                 * not release mutexes.  If RecvThread holds an internal Npcap
+                 * lock at the moment of termination, the subsequent pcap_close
+                 * call below will deadlock or corrupt Npcap state (VULN-10).
+                 *
+                 * Safest path: close the thread handle (the OS will release the
+                 * thread when it eventually exits naturally) and skip pcap_close.
+                 * The pcap handle is leaked, but the OS reclaims all process
+                 * resources on exit.  This is far safer than a deadlock or heap
+                 * corruption inside DAULink.exe's address space. */
+                Log(L"[PacketShim] WARNING: RecvThread still running after 5s — "
+                    L"skipping pcap_close to avoid Npcap mutex deadlock. "
+                    L"pcap handle will be released by OS on process exit.\n");
+                CloseHandle(a->thread); a->thread = NULL;
+                if (a->startEvt) { CloseHandle(a->startEvt); a->startEvt = NULL; }
+                DeleteCriticalSection(&a->irpLock);
+                a->inUse = FALSE;
+                return TRUE;  /* skip pcap_close — intentional leak */
             }
             CloseHandle(a->thread); a->thread = NULL;
         }

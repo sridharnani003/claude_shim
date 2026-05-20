@@ -295,7 +295,10 @@ static void LogFile(LPCWSTR fmt, ...)
     WCHAR line[600];
     StringCchPrintfW(line, 600, L"[%10.6f] %s", secs, msg);
 
-    char utf8[1200];
+    /* 600 WCHARs × 4 bytes worst-case UTF-8 = 2400 bytes.
+     * Previous size of 1200 could cause WideCharToMultiByte to return 0
+     * for lines with non-ASCII content, silently dropping the log entry. */
+    char utf8[2400];
     int n = WideCharToMultiByte(CP_UTF8, 0, line, -1,
                                 utf8, (int)sizeof(utf8) - 1,
                                 NULL, NULL);
@@ -335,7 +338,7 @@ static void Log(LPCWSTR fmt, ...)
         WCHAR line[600];
         StringCchPrintfW(line, 600, L"[%10.6f] %s", secs, msg);
 
-        char utf8[1200];
+        char utf8[2400]; /* 600 WCHARs × 4 bytes worst-case UTF-8 */
         int n = WideCharToMultiByte(CP_UTF8, 0, line, -1,
                                     utf8, (int)sizeof(utf8) - 1,
                                     NULL, NULL);
@@ -726,10 +729,20 @@ static void FetchMac(void)
     PIP_ADAPTER_ADDRESSES p0 = (PIP_ADAPTER_ADDRESSES)malloc(bufLen);
     if (!p0) { FreeLibrary(hIPHlp); return; }
 
-    if (pfnGAA(AF_UNSPEC,
-               GAA_FLAG_SKIP_UNICAST | GAA_FLAG_SKIP_ANYCAST |
-               GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
-               NULL, p0, &bufLen) == ERROR_SUCCESS) {
+    /* First call may return ERROR_BUFFER_OVERFLOW and update bufLen with the
+     * exact size needed (common on machines with many virtual adapters).
+     * Retry once with the corrected size so g_Mac is always populated. */
+    ULONG flags = GAA_FLAG_SKIP_UNICAST | GAA_FLAG_SKIP_ANYCAST |
+                  GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    ULONG result = pfnGAA(AF_UNSPEC, flags, NULL, p0, &bufLen);
+    if (result == ERROR_BUFFER_OVERFLOW) {
+        free(p0);
+        p0 = (PIP_ADAPTER_ADDRESSES)malloc(bufLen);
+        if (!p0) { FreeLibrary(hIPHlp); return; }
+        result = pfnGAA(AF_UNSPEC, flags, NULL, p0, &bufLen);
+    }
+
+    if (result == ERROR_SUCCESS) {
         /* g_NpcapGuid is like {GUID}; AdapterName is like GUID (no braces) */
         LPCWSTR cmp = g_NpcapGuid;
         if (cmp[0] == L'{') cmp++;          /* skip leading brace   */
@@ -820,6 +833,20 @@ static HANDLE OpenPcapHandle(DWORD acc, DWORD share, DWORD flags)
         InitializeCriticalSection(&g_Adp[i].irpLock);
         g_Adp[i].startEvt = CreateEventW(NULL, FALSE, FALSE, NULL);
         g_Adp[i].thread   = CreateThread(NULL, 0, RecvThread, &g_Adp[i], 0, NULL);
+        if (!g_Adp[i].thread) {
+            /* Thread creation failed — clean up and report error rather than
+             * returning a handle that would silently never deliver any frames. */
+            DWORD err = GetLastError();
+            Log(L"[PacketShim] ERROR: CreateThread failed (%u) — slot %d not usable\n",
+                err, i);
+            CloseHandle(g_Adp[i].startEvt);
+            DeleteCriticalSection(&g_Adp[i].irpLock);
+            ZeroMemory(&g_Adp[i], sizeof(AdpEntry));
+            LeaveCriticalSection(&g_Lock);
+            g_pcapClose(pcap);
+            SetLastError(ERROR_MAX_THRDS_REACHED);
+            return INVALID_HANDLE_VALUE;
+        }
         LeaveCriticalSection(&g_Lock);
         HANDLE fh = (HANDLE)(FAKE_ADP_BASE + (ULONG_PTR)i);
         Log(L"[PacketShim] pcap_open_live OK → slot %d acc=0x%08X\n", i, acc);
@@ -1259,12 +1286,21 @@ static BOOL BuildEnumResponse(PVOID buf, ULONG len, PULONG written)
     ULONG dw     = (ULONG)(wcslen(descStr)      + 1) * sizeof(WCHAR);
     ULONG needed = sizeof(ULONG) + nw + dw + sizeof(WCHAR);
     *written = needed;
-    if (len < needed) return FALSE;
+    /* buf=NULL or len too small: report needed size and return FALSE so the
+     * caller can retry with a correctly-sized buffer. */
+    if (!buf || len < needed) return FALSE;
 
     *((PULONG)buf) = 1;
-    PWCHAR p = (PWCHAR)((PUCHAR)buf + sizeof(ULONG));
-    StringCchCopyW(p, len / sizeof(WCHAR), g_AdapterName); p += wcslen(g_AdapterName) + 1;
-    StringCchCopyW(p, len / sizeof(WCHAR), descStr);       p += wcslen(descStr)       + 1;
+    /* Track remaining space accurately so each StringCchCopyW receives the
+     * correct count — passing len/sizeof(WCHAR) for the second write would
+     * overstate the available room once p has advanced past the first string. */
+    PWCHAR  p    = (PWCHAR)((PUCHAR)buf + sizeof(ULONG));
+    ULONG   rem  = len - sizeof(ULONG);  /* bytes remaining after the count field */
+    StringCchCopyW(p, rem / sizeof(WCHAR), g_AdapterName);
+    p   += wcslen(g_AdapterName) + 1;
+    rem -= nw;
+    StringCchCopyW(p, rem / sizeof(WCHAR), descStr);
+    p   += wcslen(descStr) + 1;
     *p = L'\0';
     return TRUE;
 }
@@ -1383,6 +1419,14 @@ BOOL WINAPI Hook_DeviceIoControl(
     /* Control device — only ENUM_ADAPTERS */
     if (hDev == FAKE_CONTROL_HANDLE) {
         if (dwCode == IOCTL_ENUM_ADAPTERS) {
+            /* pOut=NULL is legal — caller probing the required buffer size. */
+            if (!pOut) {
+                ULONG needed = 0;
+                BuildEnumResponse(NULL, 0, &needed);
+                if (pRet) *pRet = needed;
+                SetLastError(ERROR_INSUFFICIENT_BUFFER);
+                return FALSE;
+            }
             ULONG wr = 0;
             BOOL ok = BuildEnumResponse(pOut, nOut, &wr);
             if (pRet) *pRet = wr;
@@ -1397,7 +1441,7 @@ BOOL WINAPI Hook_DeviceIoControl(
 
     /* IOCTL_GET_MAC on MAC-query handle (or any adapter handle) */
     if (dwCode == IOCTL_GET_MAC) {
-        if (nOut < 6) { SetLastError(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+        if (!pOut || nOut < 6) { SetLastError(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
         CopyMemory(pOut, g_Mac, 6);
         if (pRet) *pRet = 6;
         Log(L"[PacketShim] IOCTL_GET_MAC → %02X:%02X:%02X:%02X:%02X:%02X\n",
@@ -1438,8 +1482,15 @@ BOOL WINAPI Hook_CloseHandle(HANDLE h)
         if (a->pcap && g_pcapBreakloop) g_pcapBreakloop(a->pcap);
         if (a->startEvt) SetEvent(a->startEvt);
         if (a->thread) {
-            if (WaitForSingleObject(a->thread, 5000) == WAIT_TIMEOUT)
-                Log(L"[PacketShim] WARNING: RecvThread did not exit within 5s\n");
+            if (WaitForSingleObject(a->thread, 5000) == WAIT_TIMEOUT) {
+                /* RecvThread is still alive after 5 s — force-terminate it
+                 * before releasing the pcap handle.  If we call pcap_close
+                 * while RecvThread is still inside pcap_next_ex the internal
+                 * buffer is freed under a live pointer, causing a crash. */
+                Log(L"[PacketShim] WARNING: RecvThread did not exit in 5s — terminating\n");
+                TerminateThread(a->thread, 1);
+                WaitForSingleObject(a->thread, 1000); /* wait for OS to confirm exit */
+            }
             CloseHandle(a->thread); a->thread = NULL;
         }
         if (a->startEvt) { CloseHandle(a->startEvt); a->startEvt = NULL; }
@@ -1548,7 +1599,11 @@ BOOL WINAPI Hook_WriteFile(
                 WORD winNum     = (WORD)fp2[22] | ((WORD)fp2[23] << 8);
                 WORD missingCnt = (WORD)fp2[24] | ((WORD)fp2[25] << 8);
                 if (missingCnt > 0) {
-                    /* RETRANSMIT NEXT-WIN: record it */
+                    /* RETRANSMIT NEXT-WIN: record it.
+                     * retxWindow is written before retxPending is set.
+                     * On x86 (TSO) stores are never reordered past later stores,
+                     * so RecvThread seeing retxPending=1 is guaranteed to also
+                     * see the updated retxWindow.  Safe on this platform. */
                     a->retxWindow = winNum;
                     InterlockedExchange(&a->retxPending, 1);
                     Log(L"[PacketShim] RetxTrack: window=0x%04X missing=%u — awaiting DAU retransmit\n",
@@ -1651,8 +1706,11 @@ BOOL WINAPI Hook_ReadFile(
             SetLastError(ERROR_IO_PENDING);
             return FALSE;
         }
-        /* Synchronous: block until packet */
-        while (TRUE) {
+        /* Synchronous: block until packet.
+         * DAULink.exe always uses overlapped I/O on the data handle so this
+         * path is a safety fallback only.  Check stopThread on each iteration
+         * so Hook_CloseHandle can break this loop if needed. */
+        while (!a->stopThread) {
             struct pcap_pkthdr *hdr = NULL;
             const unsigned char *pkt = NULL;
             int r = g_pcapNextEx(a->pcap, &hdr, &pkt);
@@ -1662,8 +1720,11 @@ BOOL WINAPI Hook_ReadFile(
                 if (lpRead) *lpRead = cl;
                 return TRUE;
             }
+            /* r==0: 1 ms timeout, retry.  r<0: pcap error or breakloop — exit. */
             if (r != 0) { SetLastError(ERROR_READ_FAULT); return FALSE; }
         }
+        SetLastError(ERROR_OPERATION_ABORTED);
+        return FALSE;
     }
     if (g_OrigRF)
         return g_OrigRF(hFile, lpBuf, nBytes, lpRead, lpOv);
